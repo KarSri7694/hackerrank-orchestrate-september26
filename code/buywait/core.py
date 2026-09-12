@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -11,6 +12,13 @@ from .domain import (AffordabilityStatus, DecisionCore, EventStatus, FinancialEv
 from .reconciliation import reconcile_context
 
 ZERO = Decimal("0")
+
+
+def _add_months(day: date, months: int = 1) -> date:
+    month_index = day.year * 12 + day.month - 1 + months
+    year, month_index = divmod(month_index, 12)
+    month = month_index + 1
+    return date(year, month, min(day.day, calendar.monthrange(year, month)[1]))
 
 
 def _cash(event: FinancialEvent, home_currency: str, fx, on_date: date) -> Decimal:
@@ -32,27 +40,40 @@ def _effective_events(ctx: RequestContext, fx) -> list[tuple[date, Decimal, str,
         event_day = event.settlement_date or event.event_date
         if event_day >= request_date and event_day <= end:
             rows.append((event_day, _cash(event, ctx.profile.home_currency, fx, event_day), event.event_id, event))
-    # Infer recurrence only from repeated same-user/category/direction records.
+    # Infer recurrence only from stable monthly histories. Irregular variable
+    # spending must not become a fabricated recurring obligation.
     groups: dict[tuple[str, str, str], list[FinancialEvent]] = defaultdict(list)
+    terminal_streams: set[tuple[str, str]] = set()
     for event in ctx.events:
         if event.status == EventStatus.SETTLED and event.amount is not None:
             groups[(event.category, event.description, event.direction)].append(event)
+            if any(word in event.description.lower() for word in ("final", "last", "ended", "end of", "terminated")):
+                terminal_streams.add((event.category, event.direction))
     for group in groups.values():
         ordered = sorted(group, key=lambda e: e.event_date)
-        if len(ordered) < 2:
+        if len(ordered) < 3:
             continue
         gaps = [(b.event_date - a.event_date).days for a, b in zip(ordered, ordered[1:])]
-        cadence = round(sum(gaps) / len(gaps))
-        if cadence < 20 or cadence > 45:
+        sorted_gaps = sorted(gaps)
+        median_gap = sorted_gaps[len(sorted_gaps) // 2]
+        if median_gap < 25 or median_gap > 35 or any(abs(gap - median_gap) > 3 for gap in gaps):
             continue
         last = ordered[-1]
+        # A terminal payroll/contract record is evidence that the historical
+        # stream has ended.  Do not manufacture income after a final event.
+        if (last.category, last.direction) in terminal_streams:
+            continue
         next_day = last.event_date
         while next_day < request_date:
-            next_day += timedelta(days=cadence)
+            next_day = _add_months(next_day)
         while next_day <= end:
-            if not any(x[2] == last.event_id and x[0] == next_day for x in rows):
+            # An explicit event on the same date wins over an inferred one;
+            # descriptions can differ when a bank/payroll system changes its
+            # wording, so category/direction/date are the stable identity.
+            same_stream_exists = any(x[0] == next_day and x[3].category == last.category and x[3].direction == last.direction for x in rows)
+            if not same_stream_exists:
                 rows.append((next_day, _cash(last, ctx.profile.home_currency, fx, next_day), last.event_id, last))
-            next_day += timedelta(days=cadence)
+            next_day = _add_months(next_day)
     return rows
 
 

@@ -35,3 +35,11 @@ python code/main.py
 Configuration is loaded from `.env` with `python-dotenv`. `OPENAI_BASE_URL` supports compatible OpenAI-style endpoints. The runner defaults to four turns and eight tool calls, sends only relevant local evidence images as base64 `input_image` parts, and falls back to deterministic solving in `auto` mode.
 
 `fastmcp` is declared in the repository-level `requirements.txt`.
+
+Run the sample regression evaluator:
+
+```text
+python code/evaluation/main.py --samples
+```
+
+It runs the current deterministic solver over every row in `sample_requests.csv`, compares the six labeled fields semantically, prints per-field and overall accuracy, and prints expected-versus-actual diffs for failures with a likely failure category. It does not alter solver logic or hardcode sample request IDs.
