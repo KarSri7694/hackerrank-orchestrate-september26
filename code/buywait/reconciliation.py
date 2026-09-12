@@ -7,7 +7,7 @@ from decimal import Decimal
 from .domain import EventStatus, EvidenceFact, FinancialEvent
 
 _AMENDMENT_EFFECTS = {"amend", "amendment", "amount_amendment", "date_amendment", "delay", "delayed", "confirm", "confirmed", "add_fact", "settle", "settled", "image_amount", "stream_update"}
-_CANCELLATION_EFFECTS = {"cancel", "cancelled", "cancellation", "terminate", "terminated"}
+_CANCELLATION_EFFECTS = {"cancel", "cancelled", "cancellation", "terminate", "terminated", "internal_transfer"}
 _STATUS_RANK = {EventStatus.SETTLED: 3, EventStatus.SCHEDULED: 2, EventStatus.PENDING: 1, None: 0}
 
 
@@ -55,6 +55,9 @@ def _apply_event_facts(event: FinancialEvent, related: list[tuple[int, EvidenceF
         updated = replace(updated, event_date=date_fact.effective_date, settlement_date=date_fact.effective_date)
     if status_fact:
         updated = replace(updated, status=status_fact.status)
+    recurrence_fact = _pick([item for item in related if item[1].recurring is not None or item[1].recurrence_days is not None], event, "date")
+    if recurrence_fact:
+        updated = replace(updated, recurrence_days=(0 if recurrence_fact.recurring is False else recurrence_fact.recurrence_days))
     return updated
 
 
@@ -104,6 +107,18 @@ def reconcile_events(events, facts) -> tuple[FinancialEvent, ...]:
         if fact.related_event_id:
             by_event.setdefault(fact.related_event_id, []).append((position, fact))
     resolved = [_apply_event_facts(event, by_event.get(event.event_id, [])) for event in events]
+    # Employment, rent, and similar stream evidence often has no one-to-one
+    # event row. A terminal stream fact must stop inferred recurrence as well
+    # as supplied future occurrences; the supplied opening balance already
+    # accounts for cash settled before the request horizon.
+    for fact in facts:
+        if fact.related_event_id is not None or fact.effect not in _CANCELLATION_EFFECTS:
+            continue
+        if not fact.category or not fact.direction:
+            continue
+        resolved = [replace(event, status=EventStatus.CANCELLED)
+                    if event.category == fact.category and event.direction == fact.direction
+                    else event for event in resolved]
     user_id = resolved[0].user_id if resolved else ""
     for position, fact in enumerate(facts):
         if fact.related_event_id is None:

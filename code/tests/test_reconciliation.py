@@ -42,6 +42,14 @@ class ReconciliationTests(unittest.TestCase):
         fact = EvidenceFact("image_01", "confirm", "e1", Decimal("725"), "USD")
         self.assertEqual(reconcile_events((raw,), (fact,))[0].amount, Decimal("725"))
 
+    def test_stream_termination_without_event_id_stops_recurrence_source(self):
+        salary = event("salary", Decimal("100"), "credit")
+        salary = salary.__class__(salary.event_id, salary.user_id, "income", salary.description, "salary", salary.direction, salary.amount, salary.currency, salary.event_date, salary.settlement_date, salary.status, salary.linked_event_id, salary.flexibility, salary.minimum_allowed_amount)
+        resolved = reconcile_events((salary,), (
+            EvidenceFact("message_salary", "terminate", category="salary", direction="credit", effective_date=date(2025, 1, 15)),
+        ))
+        self.assertEqual(resolved[0].status, EventStatus.CANCELLED)
+
     def test_pending_credit_is_ignored_but_pending_debit_reserved(self):
         credit = event("credit", Decimal("100"), "credit", EventStatus.PENDING)
         debit = event("debit", Decimal("100"), "debit", EventStatus.PENDING)

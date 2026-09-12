@@ -16,6 +16,7 @@ class AgentConfig:
     max_turns: int = 4
     max_tool_calls: int = 8
     max_evidence_calls: int = 4
+    max_critique_rounds: int = 2
     image_detail: str = "high"
 
     @classmethod
@@ -33,6 +34,6 @@ class AgentConfig:
             max_turns=min(int(value("AGENT_MAX_TURNS", "4")), 6),
             max_tool_calls=min(int(value("AGENT_MAX_TOOL_CALLS", "8")), 12),
             max_evidence_calls=min(int(value("AGENT_MAX_EVIDENCE_CALLS", "4")), 8),
+            max_critique_rounds=min(max(1, int(value("AGENT_MAX_CRITIQUE_ROUNDS", "2"))), 2),
             image_detail=value("OPENAI_IMAGE_DETAIL", "high") or "high",
         )
-

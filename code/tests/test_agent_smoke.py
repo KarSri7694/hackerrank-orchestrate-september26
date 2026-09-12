@@ -39,12 +39,12 @@ class FakeOpenAI:
         self.calls.append(kwargs)
         if len(self.calls) == 1:
             return Response([Item("function_call", name="get_case", call_id="call_1", arguments=json.dumps({"request_id": "request_26"}))])
-        payload = {"request_id": "request_26", "selected_method": "full_payment", "selected_payment_option_id": None, "payments": [{"date": "2025-08-03", "amount": "15656000"}], "spending_changes": [], "reasoning_summary": "Verified with the case and simulator.", "evidence_used": []}
+        payload = {"agree": True, "issue_type": None, "supporting_evidence_ids": [], "correction": None, "summary": "The deterministic result is supported."}
         return Response([], json.dumps(payload))
 
 
 class AgentSmokeTest(unittest.TestCase):
-    def test_bounded_loop_dispatches_mcp_tool_and_validates_plan(self):
+    def test_bounded_loop_dispatches_mcp_tool_and_keeps_deterministic_plan(self):
         app = Application(ROOT / "dataset")
         fake = FakeOpenAI()
         config = AgentConfig(api_key="test-key", ai_mode="enabled", base_url="https://example.invalid/v1")

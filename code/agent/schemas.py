@@ -4,7 +4,7 @@ import json
 from datetime import date
 from decimal import Decimal
 
-from buywait.domain import DecisionCore, Payment, PaymentMethod, SpendingChange
+from buywait.domain import PaymentMethod
 
 FINAL_DECISION_SCHEMA = {
     "type": "object",
@@ -18,6 +18,33 @@ FINAL_DECISION_SCHEMA = {
         "evidence_used": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["request_id", "selected_method", "selected_payment_option_id", "payments", "spending_changes", "reasoning_summary", "evidence_used"],
+    "additionalProperties": False,
+}
+
+# The model critiques state assumptions only. It has no fields with which to
+# select a payment method, schedule, or spending change.
+CRITIQUE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "agree": {"type": "boolean"},
+        "issue_type": {"type": ["string", "null"], "enum": [
+            "missing_event", "cancelled_event", "amended_event", "incorrect_recurrence",
+            "wrong_stream_termination", "internal_transfer", "duplicate_lifecycle",
+            "incorrect_evidence_interpretation", "one_time_vs_recurring", None,
+        ]},
+        "supporting_evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "correction": {"type": ["object", "null"], "properties": {
+            "evidence_id": {"type": "string"}, "effect": {"type": "string"},
+            "related_event_id": {"type": ["string", "null"]}, "amount": {"type": ["string", "null"]},
+            "currency": {"type": ["string", "null"]}, "effective_date": {"type": ["string", "null"]},
+            "status": {"type": ["string", "null"]}, "category": {"type": ["string", "null"]},
+            "direction": {"type": ["string", "null"]}, "description": {"type": ["string", "null"]},
+            "recurring": {"type": ["boolean", "null"]}, "recurrence_days": {"type": ["integer", "null"]},
+            "flexibility": {"type": ["string", "null"]}, "minimum_allowed_amount": {"type": ["string", "null"]},
+        }, "required": ["evidence_id", "effect", "related_event_id", "amount", "currency", "effective_date", "status", "category", "direction", "description", "recurring", "recurrence_days", "flexibility", "minimum_allowed_amount"], "additionalProperties": False},
+        "summary": {"type": "string"},
+    },
+    "required": ["agree", "issue_type", "supporting_evidence_ids", "correction", "summary"],
     "additionalProperties": False,
 }
 
@@ -42,4 +69,3 @@ def response_function_calls(response):
         if getattr(item, "type", None) == "function_call":
             calls.append({"name": item.name, "call_id": item.call_id, "arguments": item.arguments})
     return calls
-

@@ -166,6 +166,15 @@ class DecisionCore:
 
 
 @dataclass(frozen=True)
+class CorrectionEvaluation:
+    """Result of deterministically checking an evidence-backed state correction."""
+    accepted: bool
+    reason: str
+    decision: DecisionCore
+    facts: tuple[EvidenceFact, ...] = ()
+
+
+@dataclass(frozen=True)
 class RequestContext:
     request: FinancialRequest
     profile: FinancialProfile
