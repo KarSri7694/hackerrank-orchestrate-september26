@@ -161,3 +161,4 @@ class RequestContext:
     events: tuple[FinancialEvent, ...]
     payment_options: tuple[PaymentOption, ...]
     evidence_refs: tuple[EvidenceReference, ...]
+    evidence_facts: tuple[EvidenceFact, ...] = ()

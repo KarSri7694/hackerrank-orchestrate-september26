@@ -8,6 +8,7 @@ from itertools import combinations
 from .domain import (AffordabilityStatus, DecisionCore, EventStatus, FinancialEvent,
                      Payment, PaymentMethod, PlanCandidate, RequestContext,
                      SimulationResult, SpendingChange)
+from .reconciliation import reconcile_context
 
 ZERO = Decimal("0")
 
@@ -25,6 +26,8 @@ def _effective_events(ctx: RequestContext, fx) -> list[tuple[date, Decimal, str,
     rows: list[tuple[date, Decimal, str, FinancialEvent]] = []
     for event in ctx.events:
         if event.status in {EventStatus.FAILED, EventStatus.CANCELLED, EventStatus.UNREALIZED} or event.amount is None:
+            continue
+        if event.status == EventStatus.PENDING and event.direction == "credit":
             continue
         event_day = event.settlement_date or event.event_date
         if event_day >= request_date and event_day <= end:
@@ -61,6 +64,7 @@ def _change_amount(event: FinancialEvent, change: SpendingChange, fx, home: str,
 
 
 def simulate(ctx: RequestContext, fx, payments: tuple[Payment, ...] = (), changes: tuple[SpendingChange, ...] = ()) -> SimulationResult:
+    ctx = reconcile_context(ctx)
     changes_by_id = {c.event_id: c for c in changes}
     timeline = _effective_events(ctx, fx)
     balances = ctx.profile.current_available_balance
@@ -86,6 +90,7 @@ def simulate(ctx: RequestContext, fx, payments: tuple[Payment, ...] = (), change
 
 
 def baseline(ctx: RequestContext, fx) -> tuple[Decimal, date | None]:
+    ctx = reconcile_context(ctx)
     base = simulate(ctx, fx)
     # The minimum projected balance already includes all required future cash flows.
     safe_today = max(ZERO, base.minimum_projected_balance - ctx.profile.minimum_balance_to_keep)
@@ -106,6 +111,8 @@ def expand_option(option) -> tuple[Payment, ...]:
 
 
 def legal_changes(ctx: RequestContext, events: list[FinancialEvent], maximum: int = 3) -> list[tuple[SpendingChange, ...]]:
+    ctx = reconcile_context(ctx)
+    events = list(ctx.events)
     candidates: list[tuple[SpendingChange, ...]] = [()]
     for event in events:
         if event.status != EventStatus.SETTLED or not event.flexibility or event.flexibility == "fixed":
@@ -128,6 +135,7 @@ def legal_changes(ctx: RequestContext, events: list[FinancialEvent], maximum: in
 
 
 def solve(ctx: RequestContext, fx) -> DecisionCore:
+    ctx = reconcile_context(ctx)
     safe_today, earliest = baseline(ctx, fx)
     req = ctx.request
     candidates: list[PlanCandidate] = []

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -9,6 +10,7 @@ from .adapters.exchange_rates import CsvExchangeRates
 from .core import baseline, simulate, solve
 from .domain import EvidenceFact, Payment, SpendingChange
 from .evidence import EvidenceService
+from .reconciliation import reconcile_context
 
 
 class Application:
@@ -21,6 +23,14 @@ class Application:
 
     def _context(self, request_id: str):
         return self.repository.context(request_id)
+
+    def context_with_evidence(self, request_id: str, facts: tuple[EvidenceFact, ...]):
+        ctx = self.repository.context(request_id)
+        return reconcile_context(replace(ctx, evidence_facts=tuple(facts)))
+
+    def decision_with_evidence(self, request_id: str, facts: tuple[EvidenceFact, ...]):
+        """Run the complete deterministic decision flow on resolved events."""
+        return solve(self.context_with_evidence(request_id, facts), self.fx)
 
     def decision(self, request_id: str):
         return solve(self._context(request_id), self.fx)
