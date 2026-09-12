@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from dataclasses import replace
 from datetime import date, datetime, timezone
@@ -10,11 +11,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from buywait.application import Application  # noqa: E402
-from buywait.core import _effective_events, _optimized_changes, _option_order, legal_changes, simulate, validate_changes  # noqa: E402
+from buywait.adapters.evidence_cache import JsonEvidenceCache  # noqa: E402
+from buywait.core import _effective_events, _optimized_changes, _option_order, legal_changes, simulate, solve, validate_changes  # noqa: E402
 from buywait.domain import (EvidenceFact, EventStatus, FinancialEvent, FinancialProfile,
                             FinancialRequest, PaymentMethod, RequestContext, SpendingChange)  # noqa: E402
 from buywait.reconciliation import reconcile_events  # noqa: E402
 from buywait.recurrence import recurring_event_ids  # noqa: E402
+from buywait.evidence import EvidenceService  # noqa: E402
 
 
 FX = type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})()
@@ -118,6 +121,23 @@ class DatasetIntegrationTests(unittest.TestCase):
         resolved = reconcile_events((debit,), (EvidenceFact("m", "internal_transfer", amount=Decimal("100"), currency="USD", effective_date=date(2025, 1, 2)),))
         self.assertEqual(resolved[0].event_type, "transfer")
 
+    def test_critic_can_correct_a_request_level_internal_transfer(self):
+        debit = FinancialEvent("debit", "u", "transfer", "Move", "transfer", "debit", Decimal("100"), "USD", date(2025, 1, 1), date(2025, 1, 1), EventStatus.SETTLED, None, "fixed", None)
+        credit = FinancialEvent("credit", "u", "transfer", "Move", "transfer", "credit", Decimal("100"), "USD", date(2025, 1, 1), date(2025, 1, 1), EventStatus.SETTLED, None, "fixed", None)
+        request = FinancialRequest("r", "u", date(2025, 1, 1), "purchase", Decimal("1"), date(2025, 1, 2), False, "transfer")
+        profile = FinancialProfile("u", "USD", Decimal("501"), Decimal("500"), (), frozenset(), frozenset(), frozenset(), frozenset({PaymentMethod.FULL}), None)
+        from buywait.domain import EvidenceReference
+        raw = RequestContext(request, profile, (debit, credit), (), (EvidenceReference("message_transfer", "bank", "u", request_id="r", text="Transfer"),))
+        app = Application.__new__(Application)
+        app.repository = type("Repo", (), {"context": lambda _self, _id: raw, "evidence": lambda _self, _id: raw.evidence_refs[0]})()
+        app.fx = FX
+        app.evidence_service = type("Evidence", (), {"facts_for": lambda _self, _refs: (), "inspect": lambda _self, _id: ()})()
+        app.decision = lambda _id: solve(raw, FX)
+        fact = EvidenceFact("message_transfer", "internal_transfer")
+        result = app.evaluate_correction("r", (fact,), ("message_transfer",))
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.decision.recommended_payment_method, PaymentMethod.FULL)
+
     def test_explicit_new_recurring_stream_forecasts_but_one_time_income_does_not(self):
         recurring = EvidenceFact("m_salary", "stream_update", amount=Decimal("100"), currency="USD", effective_date=date(2025, 1, 15), status=EventStatus.SCHEDULED, category="salary", direction="credit", description="New Employer", recurring=True, recurrence_days=30, stream_source="New Employer")
         one_time = EvidenceFact("m_bonus", "one_time", amount=Decimal("75"), currency="USD", effective_date=date(2025, 1, 16), status=EventStatus.SCHEDULED, category="bonus", direction="credit", description="Referral bonus", recurring=False, stream_source="Referral bonus")
@@ -127,6 +147,41 @@ class DatasetIntegrationTests(unittest.TestCase):
         self.assertIn(date(2025, 2, 15), dates)
         self.assertEqual(dates.count(date(2025, 1, 16)), 1)
         self.assertEqual(sum(row[3].event_id == "evidence:m_bonus:1" for row in _effective_events(ctx, FX)), 1)
+
+    def test_aggregate_salary_update_replaces_old_salary_forecasts_only_after_effective_date(self):
+        salaries = []
+        for source, amount, day in (("Employer A", "100", 10), ("Employer B", "200", 12)):
+            for month in (10, 11, 12):
+                salaries.append(FinancialEvent(f"{source}-{month}", "u", "income", source, "salary", "credit", Decimal(amount), "USD", date(2024, month, day), date(2024, month, day), EventStatus.SETTLED, None, "fixed", None))
+        stipend = [FinancialEvent(f"stipend-{month}", "u", "income", "Grant", "stipend", "credit", Decimal("50"), "USD", date(2024, month, 5), date(2024, month, 5), EventStatus.SETTLED, None, "fixed", None) for month in (10, 11, 12)]
+        aggregate = EvidenceFact("message_total", "aggregate_stream_update", amount=Decimal("250"), currency="USD", effective_date=date(2025, 2, 15), status=EventStatus.SCHEDULED, category="salary", direction="credit", recurring=True, recurrence_days=30, stream_source="household")
+        resolved = reconcile_events(tuple(salaries + stipend), (aggregate,))
+        req = FinancialRequest("r", "u", date(2025, 1, 1), "purchase", Decimal("1"), date(2025, 4, 1), False, "text")
+        ctx = RequestContext(req, context(()).profile, resolved, (), ())
+        rows = _effective_events(ctx, FX)
+        salary_on_effective = [amount for day, amount, _, item in rows if day == date(2025, 2, 15) and item.category == "salary"]
+        self.assertEqual(salary_on_effective, [Decimal("250")])
+        self.assertTrue(any(day > date(2025, 2, 15) and item.category == "stipend" for day, _, _, item in rows))
+        self.assertFalse(any(day >= date(2025, 2, 15) and item.category == "salary" and amount != Decimal("250") for day, amount, _, item in rows))
+
+    def test_persistent_evidence_cache_prevents_reextraction_in_fresh_service(self):
+        from buywait.domain import EvidenceReference
+        reference = EvidenceReference("message_cache", "bank", "u", text="Amount 12 USD")
+        repository = type("Repo", (), {"evidence": lambda _self, _id: reference})()
+        class Extractor:
+            model = "cache-test"
+            def __init__(self): self.calls = 0
+            def extract(self, _ref):
+                self.calls += 1
+                return (EvidenceFact("message_cache", "amend", amount=Decimal("12"), currency="USD"),)
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = JsonEvidenceCache(Path(temporary) / "facts.json")
+            first = Extractor()
+            self.assertEqual(EvidenceService(repository, first, cache).inspect("message_cache")[0].amount, Decimal("12"))
+            second = Extractor()
+            self.assertEqual(EvidenceService(repository, second, JsonEvidenceCache(Path(temporary) / "facts.json")).inspect("message_cache")[0].amount, Decimal("12"))
+            self.assertEqual(first.calls, 1)
+            self.assertEqual(second.calls, 0)
 
     def test_newer_same_source_then_settled_then_safer_precedence(self):
         base = event("e", date(2025, 1, 1))

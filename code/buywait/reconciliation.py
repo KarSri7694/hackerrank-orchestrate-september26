@@ -7,7 +7,7 @@ from decimal import Decimal
 from .domain import EventStatus, EvidenceFact, FinancialEvent
 from .recurrence import event_stream_key, stream_key
 
-_AMENDMENT_EFFECTS = {"amend", "amendment", "amount_amendment", "date_amendment", "delay", "delayed", "confirm", "confirmed", "add_fact", "settle", "settled", "image_amount", "stream_update"}
+_AMENDMENT_EFFECTS = {"amend", "amendment", "amount_amendment", "date_amendment", "delay", "delayed", "confirm", "confirmed", "add_fact", "settle", "settled", "image_amount", "stream_update", "aggregate_stream_update"}
 _CANCELLATION_EFFECTS = {"cancel", "cancelled", "cancellation", "terminate", "terminated"}
 _STATUS_RANK = {EventStatus.SETTLED: 3, EventStatus.SCHEDULED: 2, EventStatus.PENDING: 1, None: 0}
 
@@ -68,7 +68,7 @@ def _stream_event(fact: EvidenceFact, user_id: str, position: int) -> FinancialE
     terminal = fact.effect in _CANCELLATION_EFFECTS
     return FinancialEvent(
         event_id=f"evidence:{fact.evidence_id}:{position}", user_id=user_id,
-        event_type="income" if fact.direction == "credit" else "expense",
+        event_type="aggregate_stream_update" if fact.effect == "aggregate_stream_update" else ("income" if fact.direction == "credit" else "expense"),
         description=fact.stream_source or fact.description or ("Terminal stream evidence" if terminal else "Evidence stream update"),
         category=fact.category, direction=fact.direction, amount=fact.amount,
         currency=fact.currency or "", event_date=fact.effective_date,
@@ -179,6 +179,16 @@ def reconcile_events(events, facts) -> tuple[FinancialEvent, ...]:
                 # this fact. Marking the explicit pair avoids any category-
                 # wide or one-sided suppression.
                 resolved = [replace(event, event_type="internal_transfer") if event.event_id in pair else event for event in resolved]
+    # An aggregate update is authoritative only prospectively. Do not alter
+    # settled history, but prevent supplied future rows from being counted in
+    # addition to the new aggregate recurrence.
+    for fact in facts:
+        if fact.effect != "aggregate_stream_update" or not (fact.category and fact.direction and fact.effective_date):
+            continue
+        resolved = [replace(event, event_type="aggregate_superseded")
+                    if event.category == fact.category and event.direction == fact.direction
+                    and event.status != EventStatus.SETTLED and _event_day(event) >= fact.effective_date
+                    else event for event in resolved]
     # Employment, rent, and similar stream evidence often has no one-to-one
     # event row. A terminal stream fact must stop inferred recurrence as well
     # as supplied future occurrences; the supplied opening balance already

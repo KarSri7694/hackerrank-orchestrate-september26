@@ -34,7 +34,7 @@ CRITIQUE_SCHEMA = {
         ]},
         "supporting_evidence_ids": {"type": "array", "items": {"type": "string"}},
         "correction": {"type": ["object", "null"], "properties": {
-            "evidence_id": {"type": "string"}, "effect": {"type": "string", "enum": ["cancel", "amend", "amount_amendment", "date_amendment", "delay", "settle", "image_amount", "stream_update", "terminate", "internal_transfer", "one_time"]},
+            "evidence_id": {"type": "string"}, "effect": {"type": "string", "enum": ["cancel", "amend", "amount_amendment", "date_amendment", "delay", "settle", "image_amount", "stream_update", "aggregate_stream_update", "terminate", "internal_transfer", "one_time"]},
             "related_event_id": {"type": ["string", "null"]}, "amount": {"type": ["string", "null"]},
             "currency": {"type": ["string", "null"]}, "effective_date": {"type": ["string", "null"]},
             "status": {"type": ["string", "null"]}, "category": {"type": ["string", "null"]},

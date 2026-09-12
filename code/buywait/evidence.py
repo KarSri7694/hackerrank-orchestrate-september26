@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
+from pathlib import Path
 
+from .adapters.evidence_cache import JsonEvidenceCache
 from .domain import EvidenceFact
 
 
@@ -12,18 +15,36 @@ class NullEvidenceExtractor:
 
 
 class EvidenceService:
-    def __init__(self, repository, extractor=None):
+    CACHE_SCHEMA_VERSION = "evidence-facts-v3"
+
+    def __init__(self, repository, extractor=None, persistent_cache: JsonEvidenceCache | None = None):
         self.repository = repository
         self.extractor = extractor or NullEvidenceExtractor()
         self._facts: dict[str, tuple[EvidenceFact, ...]] = {}
+        self.persistent_cache = persistent_cache
+
+    def _cache_key(self, reference) -> str:
+        content = (reference.text or "").encode("utf-8")
+        if reference.image_path and Path(reference.image_path).is_file():
+            content += Path(reference.image_path).read_bytes()
+        model = getattr(self.extractor, "model", self.extractor.__class__.__name__)
+        return f"{reference.evidence_id}:{model}:{self.CACHE_SCHEMA_VERSION}:{hashlib.sha256(content).hexdigest()}"
+
+    @staticmethod
+    def _normalized(facts, reference) -> tuple[EvidenceFact, ...]:
+        return tuple(replace(fact, source_type=fact.source_type or reference.source_type,
+                             sent_at=fact.sent_at or reference.sent_at) for fact in facts)
 
     def inspect(self, evidence_id: str) -> tuple[EvidenceFact, ...]:
         if evidence_id not in self._facts:
             ref = self.repository.evidence(evidence_id)
-            self._facts[evidence_id] = tuple(
-                replace(fact, source_type=fact.source_type or ref.source_type, sent_at=fact.sent_at or ref.sent_at)
-                for fact in self.extractor.extract(ref)
-            )
+            key = self._cache_key(ref)
+            cached = self.persistent_cache.get(key) if self.persistent_cache else None
+            if cached is None:
+                cached = self._normalized(self.extractor.extract(ref), ref)
+                if self.persistent_cache:
+                    self.persistent_cache.put(key, cached)
+            self._facts[evidence_id] = self._normalized(cached, ref)
         return self._facts[evidence_id]
 
     def register(self, facts: tuple[EvidenceFact, ...] | list[EvidenceFact]) -> None:

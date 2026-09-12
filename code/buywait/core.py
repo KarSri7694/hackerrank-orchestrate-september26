@@ -27,7 +27,7 @@ def _effective_events(ctx: RequestContext, fx) -> list[tuple[date, Decimal, str,
     end = request_date + timedelta(days=89)
     rows: list[tuple[date, Decimal, str, FinancialEvent]] = []
     for event in ctx.events:
-        if event.event_type == "internal_transfer" or event.status in {EventStatus.FAILED, EventStatus.CANCELLED, EventStatus.UNREALIZED} or event.amount is None:
+        if event.event_type in {"internal_transfer", "aggregate_superseded"} or event.status in {EventStatus.FAILED, EventStatus.CANCELLED, EventStatus.UNREALIZED} or event.amount is None:
             continue
         if event.status == EventStatus.PENDING and event.direction == "credit":
             continue
@@ -38,10 +38,10 @@ def _effective_events(ctx: RequestContext, fx) -> list[tuple[date, Decimal, str,
             rows.append((event_day, _cash(event, ctx.profile.home_currency, fx, event_day), event.event_id, event))
     for stream in detect_recurrences(ctx.events):
         last = stream.representative
-        next_day = last.settlement_date or last.event_date
+        next_day = stream.starts_on or last.settlement_date or last.event_date
         while next_day < request_date:
             next_day = stream.next_date(next_day)
-        while next_day <= end:
+        while next_day <= end and (stream.ends_before is None or next_day < stream.ends_before):
             # An explicit event on the same date wins over an inferred one;
             # descriptions can differ when a bank/payroll system changes its
             # wording, so category/direction/date are the stable identity.

@@ -6,20 +6,22 @@ from decimal import Decimal
 from pathlib import Path
 
 from .adapters.csv_repository import CsvRepository
+from .adapters.evidence_cache import JsonEvidenceCache
 from .adapters.exchange_rates import CsvExchangeRates
 from .core import _optimized_changes, baseline, simulate, solve, validate_changes
 from .domain import CorrectionEvaluation, EvidenceFact, EventStatus, Payment, SpendingChange
 from .evidence import EvidenceService
-from .reconciliation import _fact_stream_key, reconcile_context
+from .reconciliation import _fact_stream_key, _unique_transfer_pair, reconcile_context
 
 
 class Application:
     """Inbound application services used by CLI and MCP adapters."""
 
-    def __init__(self, dataset_dir: str | Path, evidence_extractor=None):
+    def __init__(self, dataset_dir: str | Path, evidence_extractor=None, evidence_cache_path: str | Path | None = None):
         self.repository = CsvRepository(dataset_dir)
         self.fx = CsvExchangeRates(Path(dataset_dir) / "exchange_rates.csv")
-        self.evidence_service = EvidenceService(self.repository, evidence_extractor)
+        cache_path = Path(evidence_cache_path) if evidence_cache_path else Path(dataset_dir) / ".evidence_cache.json"
+        self.evidence_service = EvidenceService(self.repository, evidence_extractor, JsonEvidenceCache(cache_path))
 
     def _context(self, request_id: str):
         raw = self.repository.context(request_id)
@@ -55,7 +57,7 @@ class Application:
         event_ids = {event.event_id for event in raw.events}
         allowed_effects = {"cancel", "cancelled", "cancellation", "terminate", "terminated",
                            "amend", "amendment", "amount_amendment", "date_amendment",
-                           "delay", "delayed", "settle", "settled", "image_amount", "stream_update",
+                           "delay", "delayed", "settle", "settled", "image_amount", "stream_update", "aggregate_stream_update",
                            "internal_transfer", "one_time"}
         for fact in facts:
             if fact.evidence_id not in support or fact.evidence_id not in reference_ids:
@@ -66,8 +68,13 @@ class Application:
                 return CorrectionEvaluation(False, "negative correction amount", baseline_decision)
             if fact.related_event_id and fact.related_event_id not in event_ids:
                 return CorrectionEvaluation(False, "correction references an unknown event", baseline_decision)
-            if not fact.related_event_id and not (fact.category and fact.direction and fact.effective_date):
+            if fact.effect == "internal_transfer" and not fact.related_event_id:
+                if _unique_transfer_pair(list(raw.events), fact) is None:
+                    return CorrectionEvaluation(False, "internal transfer has no unambiguous debit/credit pair", baseline_decision)
+            elif not fact.related_event_id and not (fact.category and fact.direction and fact.effective_date):
                 return CorrectionEvaluation(False, "stream correction lacks category, direction, or effective date", baseline_decision)
+            if fact.effect == "aggregate_stream_update" and not (fact.category and fact.direction and fact.amount is not None and fact.currency and fact.effective_date and fact.recurring is True and fact.recurrence_days):
+                return CorrectionEvaluation(False, "aggregate stream update lacks required recurring total", baseline_decision)
             if fact.effect in {"terminate", "terminated"} and not fact.related_event_id and not _fact_stream_key(fact):
                 return CorrectionEvaluation(False, "stream termination lacks a stable stream identity", baseline_decision)
             if fact.direction and fact.direction not in {"credit", "debit"}:
@@ -127,6 +134,8 @@ class Application:
         }
         if any(str(value).casefold() not in text for value in scalar_fields.values() if value is not None):
             return False
+        if fact.effect == "internal_transfer" and not fact.related_event_id:
+            return True
         if not any(value is not None for value in scalar_fields.values()) and not reference.related_event_id:
             return False
         return True

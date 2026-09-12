@@ -23,6 +23,8 @@ def event_stream_key(event: FinancialEvent) -> str:
 class RecurringStream:
     representative: FinancialEvent
     cadence_days: int
+    starts_on: date | None = None
+    ends_before: date | None = None
 
     def next_date(self, value: date) -> date:
         if 25 <= self.cadence_days <= 35:
@@ -68,7 +70,15 @@ def detect_recurrences(events) -> tuple[RecurringStream, ...]:
         stream = _stable_stream(values, 4)
         if stream:
             streams.append(stream)
-    overrides = [event for event in events if event.event_id.startswith("evidence:") and event.recurrence_days != 0 and event.status in {EventStatus.SCHEDULED, EventStatus.SETTLED} and event.amount is not None]
+    aggregates = [event for event in events if event.event_type == "aggregate_stream_update" and event.recurrence_days != 0 and event.status in {EventStatus.SCHEDULED, EventStatus.SETTLED} and event.amount is not None]
+    for aggregate in aggregates:
+        # Historical streams keep their history but stop forecasting once the
+        # aggregate total becomes authoritative for that category/direction.
+        streams = [RecurringStream(stream.representative, stream.cadence_days, stream.starts_on, aggregate.event_date)
+                   if (stream.representative.category, stream.representative.direction) == (aggregate.category, aggregate.direction)
+                   else stream for stream in streams]
+        streams.append(RecurringStream(aggregate, aggregate.recurrence_days or 30, aggregate.event_date))
+    overrides = [event for event in events if event.event_id.startswith("evidence:") and event.event_type != "aggregate_stream_update" and event.recurrence_days != 0 and event.status in {EventStatus.SCHEDULED, EventStatus.SETTLED} and event.amount is not None]
     for override in overrides:
         for index, stream in enumerate(streams):
             representative = stream.representative

@@ -17,7 +17,7 @@ FACT_SCHEMA = {
     "properties": {"facts": {"type": "array", "items": {
         "type": "object", "additionalProperties": False,
         "properties": {
-            "effect": {"type": "string", "enum": ["cancel", "amend", "amount_amendment", "date_amendment", "delay", "settle", "image_amount", "stream_update", "terminate", "internal_transfer", "one_time"]}, "related_event_id": {"type": ["string", "null"]},
+            "effect": {"type": "string", "enum": ["cancel", "amend", "amount_amendment", "date_amendment", "delay", "settle", "image_amount", "stream_update", "aggregate_stream_update", "terminate", "internal_transfer", "one_time"]}, "related_event_id": {"type": ["string", "null"]},
             "amount": {"type": ["string", "null"]}, "currency": {"type": ["string", "null"]},
             "effective_date": {"type": ["string", "null"]}, "status": {"type": ["string", "null"], "enum": [None] + [status.value for status in EventStatus]},
             "category": {"type": ["string", "null"]}, "direction": {"type": ["string", "null"], "enum": [None, "credit", "debit"]},
