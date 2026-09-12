@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from buywait.core import _effective_events, baseline, simulate, solve  # noqa: E402
+from buywait.core import _effective_events, _optimized_changes, baseline, legal_changes, simulate, solve  # noqa: E402
 from buywait.domain import (EventStatus, EvidenceFact, FinancialEvent, FinancialProfile,
                             FinancialRequest, PaymentMethod, RequestContext)  # noqa: E402
 from buywait.reconciliation import reconcile_events  # noqa: E402
@@ -109,6 +109,29 @@ class ReconciliationTests(unittest.TestCase):
         rows = [row for row in _effective_events(ctx, fx) if row[0] == date(2024, 4, 15)]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][3].event_id, "scheduled")
+
+    def test_optimizer_finds_minimum_reduction_and_resimulates(self):
+        history = tuple(FinancialEvent(str(i), "u1", "expense", "dining", "dining", "debit", Decimal("100"), "USD", date(2024, m, 15), date(2024, m, 15), EventStatus.SETTLED, None, "reducible", Decimal("0")) for i, m in enumerate((10, 11, 12), 1))
+        request = FinancialRequest("r1", "u1", date(2025, 1, 1), "purchase", Decimal("450"), date(2025, 2, 28), False, "test")
+        profile = FinancialProfile("u1", "USD", Decimal("1000"), Decimal("500"), (), frozenset(), frozenset({"dining"}), frozenset(), frozenset({PaymentMethod.FULL}), None)
+        ctx = RequestContext(request, profile, history, (), ())
+        fx = type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})()
+        changes = _optimized_changes(ctx, fx, ((__import__("buywait.domain", fromlist=["Payment"]).Payment(request.request_date, request.requested_amount),)))
+        self.assertEqual(len(changes or ()), 1)
+        self.assertEqual(changes[0].action, "reduce_to")
+        self.assertEqual(changes[0].event_id, "3")
+        self.assertGreaterEqual(changes[0].new_amount, Decimal("16.66"))
+        self.assertLessEqual(changes[0].new_amount, Decimal("16.67"))
+        self.assertTrue(simulate(ctx, fx, ((__import__("buywait.domain", fromlist=["Payment"]).Payment(request.request_date, request.requested_amount),)), tuple(changes)).safe)
+
+    def test_optimizer_excludes_protected_and_nonrecurring_targets(self):
+        protected = FinancialEvent("protected", "u1", "expense", "rent", "rent", "debit", Decimal("100"), "USD", date(2024, 12, 15), date(2024, 12, 15), EventStatus.SETTLED, None, "reducible", Decimal("0"))
+        one_off = FinancialEvent("one", "u1", "expense", "dining", "dining", "debit", Decimal("100"), "USD", date(2024, 12, 20), date(2024, 12, 20), EventStatus.SETTLED, None, "reducible", Decimal("0"))
+        req = FinancialRequest("r1", "u1", date(2025, 1, 1), "purchase", Decimal("1"), date(2025, 1, 30), False, "test")
+        profile = FinancialProfile("u1", "USD", Decimal("1000"), Decimal("500"), (), frozenset({"rent"}), frozenset({"dining"}), frozenset(), frozenset({PaymentMethod.FULL}), None)
+        ctx = RequestContext(req, profile, (protected, one_off), (), ())
+        self.assertEqual(legal_changes(ctx, list(ctx.events)), [()])
+        self.assertEqual(_optimized_changes(ctx, type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})(), ()), [])
 
 
 if __name__ == "__main__":

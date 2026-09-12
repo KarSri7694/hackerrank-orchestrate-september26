@@ -81,7 +81,9 @@ def _change_amount(event: FinancialEvent, change: SpendingChange, fx, home: str,
     original = abs(_cash(event, home, fx, on_date))
     if change.action == "stop":
         return ZERO
-    return change.new_amount if change.new_amount is not None else original
+    if change.new_amount is None:
+        return original
+    return fx.convert(change.new_amount, event.currency, home, on_date)
 
 
 def simulate(ctx: RequestContext, fx, payments: tuple[Payment, ...] = (), changes: tuple[SpendingChange, ...] = ()) -> SimulationResult:
@@ -141,10 +143,43 @@ def _calendar_months_between(start: date, end: date) -> int:
 
 def legal_changes(ctx: RequestContext, events: list[FinancialEvent], maximum: int = 3) -> list[tuple[SpendingChange, ...]]:
     ctx = reconcile_context(ctx)
+    # A recurring obligation is represented by its latest settled event.  The
+    # old implementation exposed every historical installment as a separate
+    # target, creating duplicate interventions and allowing changes that could
+    # not affect the forecast.
     events = list(ctx.events)
-    candidates: list[tuple[SpendingChange, ...]] = [()]
+    latest: dict[tuple[str, str, str], FinancialEvent] = {}
+    history: dict[tuple[str, str, str], list[FinancialEvent]] = defaultdict(list)
     for event in events:
-        if event.status != EventStatus.SETTLED or not event.flexibility or event.flexibility == "fixed":
+        if event.status == EventStatus.SETTLED and event.direction == "debit" and event.flexibility != "fixed":
+            history[(event.category, event.description, event.direction)].append(event)
+    recurring: list[FinancialEvent] = []
+    for key, values in history.items():
+        ordered = sorted(values, key=lambda e: e.event_date)
+        if len(ordered) < 3:
+            continue
+        gaps = [(b.event_date - a.event_date).days for a, b in zip(ordered, ordered[1:])]
+        median = sorted(gaps)[len(gaps) // 2]
+        if 5 <= median <= 35 and all(abs(gap - median) <= 3 for gap in gaps):
+            recurring.append(ordered[-1])
+    # Also support variable recurring categories whose descriptions rotate.
+    by_category: dict[tuple[str, str], list[FinancialEvent]] = defaultdict(list)
+    for event in events:
+        if event.status == EventStatus.SETTLED and event.direction == "debit" and event.flexibility != "fixed":
+            by_category[(event.category, event.direction)].append(event)
+    for key, values in by_category.items():
+        ordered = sorted(values, key=lambda e: e.event_date)
+        if len(ordered) < 4:
+            continue
+        gaps = [(b.event_date - a.event_date).days for a, b in zip(ordered, ordered[1:])]
+        median = sorted(gaps)[len(gaps) // 2]
+        if 5 <= median <= 35 and all(abs(gap - median) <= 3 for gap in gaps):
+            recurring.append(ordered[-1])
+    for event in recurring:
+        latest[(event.category, event.description, event.direction)] = event
+    candidates: list[tuple[SpendingChange, ...]] = [()]
+    for event in latest.values():
+        if event.category in ctx.profile.protected_categories:
             continue
         options: list[SpendingChange] = []
         if event.category in ctx.profile.stoppable_categories and event.flexibility in {"stoppable", "reducible_or_stoppable"}:
@@ -161,6 +196,49 @@ def legal_changes(ctx: RequestContext, events: list[FinancialEvent], maximum: in
             if len({c.event_id for c in combo}) == size:
                 candidates.append(tuple(combo))
     return [c for c in candidates if len(c) <= maximum]
+
+
+def _optimized_changes(ctx: RequestContext, fx, payments: tuple[Payment, ...], maximum: int = 3) -> list[SpendingChange] | None:
+    if simulate(ctx, fx, payments).safe:
+        return []
+    options = [change for group in legal_changes(ctx, list(ctx.events), maximum=1) for change in group]
+    refined: list[SpendingChange] = []
+    for change in options:
+        if change.action != "reduce_to":
+            refined.append(change)
+            continue
+        event = next(e for e in ctx.events if e.event_id == change.event_id)
+        minimum = change.new_amount or ZERO
+        current = abs(event.amount or ZERO)
+        if not simulate(ctx, fx, payments, (change,)).safe:
+            refined.append(change)
+            continue
+        # Find the largest safe amount (therefore the smallest reduction) by
+        # repeatedly re-simulating the candidate. Values are expressed in the
+        # event currency and are never allowed below its supplied floor.
+        low, high = minimum, current
+        for _ in range(40):
+            if high - low <= Decimal("0.01"):
+                break
+            mid = (low + high) / 2
+            probe = SpendingChange(change.event_id, "reduce_to", mid)
+            if simulate(ctx, fx, payments, (probe,)).safe:
+                low = mid
+            else:
+                high = mid
+        refined.append(SpendingChange(change.event_id, "reduce_to", low.quantize(Decimal("0.01"))))
+    options = refined
+    safe: list[tuple[tuple[Decimal, int, tuple[str, ...]], tuple[SpendingChange, ...]]] = []
+    for size in range(1, maximum + 1):
+        for group in combinations(options, size):
+            if len({change.event_id for change in group}) != size:
+                continue
+            if simulate(ctx, fx, payments, tuple(group)).safe:
+                reduction = sum((abs(next(e for e in ctx.events if e.event_id == c.event_id).amount or ZERO) - (c.new_amount or ZERO)) for c in group)
+                safe.append(((reduction, size, tuple(c.event_id for c in group)), tuple(group)))
+        if safe:
+            break
+    return list(sorted(safe, key=lambda item: item[0])[0][1]) if safe else None
 
 
 def solve(ctx: RequestContext, fx) -> DecisionCore:
@@ -189,9 +267,9 @@ def solve(ctx: RequestContext, fx) -> DecisionCore:
     safe_candidates = [c for c in candidates if simulate(ctx, fx, c.payments).safe]
     if not safe_candidates:
         for candidate in candidates:
-            for changes in legal_changes(ctx, list(ctx.events)):
-                if changes and simulate(ctx, fx, candidate.payments, changes).safe:
-                    safe_candidates.append(PlanCandidate(candidate.method, candidate.payments, candidate.total_payable, changes, candidate.payment_option_id))
+            changes = _optimized_changes(ctx, fx, candidate.payments)
+            if changes:
+                safe_candidates.append(PlanCandidate(candidate.method, candidate.payments, candidate.total_payable, tuple(changes), candidate.payment_option_id))
     if not safe_candidates:
         return DecisionCore(req.request_id, safe_today, AffordabilityStatus.NOT_AFFORDABLE, PaymentMethod.NOT_RECOMMENDED, (), earliest, (), {"minimum_balance": str(ctx.profile.minimum_balance_to_keep)})
     def rank(c: PlanCandidate):

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .adapters.csv_repository import CsvRepository
 from .adapters.exchange_rates import CsvExchangeRates
-from .core import baseline, simulate, solve
+from .core import _optimized_changes, baseline, simulate, solve
 from .domain import EvidenceFact, Payment, SpendingChange
 from .evidence import EvidenceService
 from .reconciliation import reconcile_context
@@ -72,13 +72,10 @@ class Application:
         return simulate(ctx, self.fx, payments, changes)
 
     def optimize_spending(self, request_id: str, payments: tuple[Payment, ...]) -> dict[str, object]:
-        from .core import legal_changes
         ctx = self._context(request_id)
-        for changes in legal_changes(ctx, list(ctx.events)):
-            result = simulate(ctx, self.fx, payments, changes)
-            if result.safe:
-                return {"possible": True, "spending_changes": [c.__dict__ for c in changes], "minimum_projected_balance": str(result.minimum_projected_balance)}
-        return {"possible": False, "spending_changes": [], "minimum_projected_balance": str(simulate(ctx, self.fx, payments).minimum_projected_balance)}
+        changes = _optimized_changes(ctx, self.fx, payments)
+        result = simulate(ctx, self.fx, payments, tuple(changes or ()))
+        return {"possible": bool(changes is not None and result.safe), "spending_changes": [c.__dict__ for c in changes or ()], "minimum_projected_balance": str(result.minimum_projected_balance)}
 
     def _validate_changes(self, ctx, changes: tuple[SpendingChange, ...]):
         if len(changes) > 3 or len({c.event_id for c in changes}) != len(changes):
