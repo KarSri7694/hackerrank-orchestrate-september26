@@ -12,6 +12,7 @@ from buywait.core import _effective_events, _optimized_changes, baseline, legal_
 from buywait.domain import (EventStatus, EvidenceFact, FinancialEvent, FinancialProfile,
                             FinancialRequest, PaymentMethod, RequestContext)  # noqa: E402
 from buywait.reconciliation import reconcile_events  # noqa: E402
+from buywait.recurrence import stream_key  # noqa: E402
 
 
 def event(event_id="e1", amount=Decimal("100"), direction="debit", status=EventStatus.SCHEDULED):
@@ -46,7 +47,7 @@ class ReconciliationTests(unittest.TestCase):
         salary = event("salary", Decimal("100"), "credit")
         salary = salary.__class__(salary.event_id, salary.user_id, "income", salary.description, "salary", salary.direction, salary.amount, salary.currency, salary.event_date, salary.settlement_date, salary.status, salary.linked_event_id, salary.flexibility, salary.minimum_allowed_amount)
         resolved = reconcile_events((salary,), (
-            EvidenceFact("message_salary", "terminate", category="salary", direction="credit", effective_date=date(2025, 1, 15)),
+            EvidenceFact("message_salary", "terminate", category="salary", direction="credit", effective_date=date(2025, 1, 15), stream_key=stream_key("salary", "credit", "test")),
         ))
         self.assertEqual(resolved[0].status, EventStatus.CANCELLED)
 
@@ -100,9 +101,8 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual([row[0] for row in generated], [date(2024, 4, 15), date(2024, 5, 15), date(2024, 6, 15)])
 
     def test_terminal_event_stops_historical_recurrence(self):
-        history = tuple(FinancialEvent(str(i), "u1", "income", "Payroll", "salary", "credit", Decimal("100"), "USD", date(2024, m, 15), date(2024, m, 15), EventStatus.SETTLED, None, "fixed", None) for i, m in enumerate((1, 2, 3), 1))
-        terminal = FinancialEvent("final", "u1", "income", "Payroll", "salary", "credit", Decimal("100"), "USD", date(2024, 4, 15), date(2024, 4, 15), EventStatus.SETTLED, None, "fixed", None)
-        terminal = terminal.__class__(terminal.event_id, terminal.user_id, terminal.event_type, "Final employer payroll", terminal.category, terminal.direction, terminal.amount, terminal.currency, terminal.event_date, terminal.settlement_date, terminal.status, terminal.linked_event_id, terminal.flexibility, terminal.minimum_allowed_amount)
+        history = tuple(FinancialEvent(str(i), "u1", "income", "Employer payroll", "salary", "credit", Decimal("100"), "USD", date(2024, m, 15), date(2024, m, 15), EventStatus.SETTLED, None, "fixed", None) for i, m in enumerate((1, 2, 3), 1))
+        terminal = FinancialEvent("final", "u1", "income", "Final employer payroll", "salary", "credit", Decimal("100"), "USD", date(2024, 4, 15), date(2024, 4, 15), EventStatus.SETTLED, None, "fixed", None)
         req = FinancialRequest("r1", "u1", date(2024, 5, 1), "purchase", Decimal("1"), date(2024, 5, 30), False, "test")
         ctx = RequestContext(req, context(()).profile, history + (terminal,), (), ())
         fx = type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})()

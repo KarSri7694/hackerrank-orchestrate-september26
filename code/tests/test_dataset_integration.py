@@ -14,7 +14,7 @@ from buywait.core import _effective_events, _optimized_changes, _option_order, l
 from buywait.domain import (EvidenceFact, EventStatus, FinancialEvent, FinancialProfile,
                             FinancialRequest, PaymentMethod, RequestContext, SpendingChange)  # noqa: E402
 from buywait.reconciliation import reconcile_events  # noqa: E402
-from buywait.recurrence import recurring_event_ids  # noqa: E402
+from buywait.recurrence import recurring_event_ids, stream_key  # noqa: E402
 
 
 FX = type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})()
@@ -78,11 +78,37 @@ class DatasetIntegrationTests(unittest.TestCase):
 
     def test_stream_fact_without_event_id_creates_recurring_override(self):
         history = [event(str(index), date(2024, month, 15), amount="100") for index, month in enumerate((10, 11, 12), 1)]
-        fact = EvidenceFact("m", "stream_update", amount=Decimal("150"), currency="USD", effective_date=date(2025, 1, 15), status=EventStatus.SCHEDULED, category="rent", direction="debit", recurring=True, recurrence_days=31)
+        fact = EvidenceFact("m", "stream_update", amount=Decimal("150"), currency="USD", effective_date=date(2025, 1, 15), status=EventStatus.SCHEDULED, category="rent", direction="debit", description="rent", recurring=True, recurrence_days=31, stream_key=stream_key("rent", "debit", "rent"))
         resolved = reconcile_events(history, (fact,))
         self.assertTrue(any(item.event_id.startswith("evidence:") for item in resolved))
         timeline = _effective_events(replace(context(resolved), evidence_facts=()), FX)
         self.assertEqual(timeline[0][1], Decimal("-150"))
+
+    def test_stream_termination_is_scoped_to_its_stable_identity(self):
+        employer_a = [FinancialEvent(f"a-{month}", "u", "income", "Employer A", "salary", "credit", Decimal("100"), "USD", date(2024, month, 15), date(2024, month, 15), EventStatus.SETTLED, None, "fixed", None) for month in (10, 11, 12)]
+        employer_b = [FinancialEvent(f"b-{month}", "u", "income", "Employer B", "salary", "credit", Decimal("200"), "USD", date(2024, month, 20), date(2024, month, 20), EventStatus.SETTLED, None, "fixed", None) for month in (10, 11, 12)]
+        fact = EvidenceFact("message_a", "terminate", category="salary", direction="credit", effective_date=date(2025, 1, 1), stream_key=stream_key("salary", "credit", "Employer A"))
+        resolved = reconcile_events(tuple(employer_a + employer_b), (fact,))
+        self.assertTrue(all(item.status == EventStatus.CANCELLED for item in resolved if item.event_id.startswith("a-")))
+        self.assertTrue(all(item.status == EventStatus.SETTLED for item in resolved if item.event_id.startswith("b-")))
+
+    def test_internal_transfer_pair_is_excluded_without_cancelling_one_side(self):
+        debit = FinancialEvent("transfer_debit", "u", "transfer", "Move savings", "transfer", "debit", Decimal("100"), "USD", date(2025, 1, 2), date(2025, 1, 2), EventStatus.SETTLED, None, "fixed", None)
+        credit = FinancialEvent("transfer_credit", "u", "transfer", "Move savings", "transfer", "credit", Decimal("100"), "USD", date(2025, 1, 2), date(2025, 1, 2), EventStatus.SETTLED, "transfer_debit", "fixed", None)
+        resolved = reconcile_events((debit, credit), (EvidenceFact("message_transfer", "internal_transfer", "transfer_debit"),))
+        self.assertEqual({item.event_type for item in resolved}, {"internal_transfer"})
+        self.assertEqual({item.status for item in resolved}, {EventStatus.SETTLED})
+        self.assertEqual(simulate(context(resolved), FX).ending_balance, Decimal("1000"))
+
+    def test_explicit_new_recurring_stream_forecasts_but_one_time_income_does_not(self):
+        recurring = EvidenceFact("m_salary", "stream_update", amount=Decimal("100"), currency="USD", effective_date=date(2025, 1, 15), status=EventStatus.SCHEDULED, category="salary", direction="credit", description="New Employer", recurring=True, recurrence_days=30, stream_key=stream_key("salary", "credit", "New Employer"))
+        one_time = EvidenceFact("m_bonus", "one_time", amount=Decimal("75"), currency="USD", effective_date=date(2025, 1, 16), status=EventStatus.SCHEDULED, category="bonus", direction="credit", description="Referral bonus", recurring=False, stream_key=stream_key("bonus", "credit", "Referral bonus"))
+        resolved = reconcile_events((), (recurring, one_time))
+        ctx = context(resolved)
+        dates = [row[0] for row in _effective_events(ctx, FX) if row[3].event_id.startswith("evidence:")]
+        self.assertIn(date(2025, 2, 15), dates)
+        self.assertEqual(dates.count(date(2025, 1, 16)), 1)
+        self.assertEqual(sum(row[3].event_id == "evidence:m_bonus:1" for row in _effective_events(ctx, FX)), 1)
 
     def test_newer_same_source_then_settled_then_safer_precedence(self):
         base = event("e", date(2025, 1, 1))

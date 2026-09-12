@@ -13,7 +13,8 @@ sys.path.insert(0, str(ROOT / "code"))
 from agent.config import AgentConfig  # noqa: E402
 from agent.runner import AgentRunner  # noqa: E402
 from buywait.domain import (AffordabilityStatus, CorrectionEvaluation, DecisionCore,
-                            Payment, PaymentMethod)  # noqa: E402
+                            EvidenceFact, EvidenceReference, Payment, PaymentMethod)  # noqa: E402
+from buywait.application import Application  # noqa: E402
 from tools.server import mcp  # noqa: E402
 
 
@@ -139,6 +140,22 @@ class AgentCriticTests(unittest.TestCase):
         self.assertEqual(len(app.applied), 2)
         self.assertEqual(result.decision.recommended_payment_method, third.recommended_payment_method)
         self.assertEqual(result.decision.trace["agent_critique"], "critique_round_limit_reached")
+
+    def test_correction_support_requires_every_extracted_field_to_match(self):
+        reference = EvidenceReference("image_1", "image", "u")
+        app = Application.__new__(Application)
+        app.evidence_service = type("Evidence", (), {"inspect": lambda _self, _id: (EvidenceFact("image_1", "amend", amount=None, currency="USD"),)})()
+        raw = type("Raw", (), {"evidence_refs": (reference,)})()
+        unsupported = EvidenceFact("image_1", "amend", amount=Decimal("500"), currency="USD")
+        self.assertFalse(app._fact_is_supported(raw, unsupported))
+
+    def test_text_fallback_rejects_unsupported_inferred_fields(self):
+        reference = EvidenceReference("message_1", "employer", "u", text="Employer A salary has ended.")
+        app = Application.__new__(Application)
+        app.evidence_service = type("Evidence", (), {"inspect": lambda _self, _id: ()})()
+        raw = type("Raw", (), {"evidence_refs": (reference,)})()
+        inferred = EvidenceFact("message_1", "terminate", amount=Decimal("500"), category="salary", direction="credit")
+        self.assertFalse(app._fact_is_supported(raw, inferred))
 
 
 if __name__ == "__main__":

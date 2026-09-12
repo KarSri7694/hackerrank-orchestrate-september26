@@ -174,6 +174,7 @@ class AgentRunner:
                 description=correction.get("description"), recurring=correction.get("recurring"),
                 recurrence_days=correction.get("recurrence_days"), flexibility=correction.get("flexibility") or "fixed",
                 minimum_allowed_amount=Decimal(correction["minimum_allowed_amount"]) if correction.get("minimum_allowed_amount") is not None else None,
+                stream_key=correction.get("stream_key"),
             ),)
         except (KeyError, ValueError, ArithmeticError):
             return ()

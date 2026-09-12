@@ -5,9 +5,10 @@ from datetime import datetime
 from decimal import Decimal
 
 from .domain import EventStatus, EvidenceFact, FinancialEvent
+from .recurrence import event_stream_key, stream_key
 
 _AMENDMENT_EFFECTS = {"amend", "amendment", "amount_amendment", "date_amendment", "delay", "delayed", "confirm", "confirmed", "add_fact", "settle", "settled", "image_amount", "stream_update"}
-_CANCELLATION_EFFECTS = {"cancel", "cancelled", "cancellation", "terminate", "terminated", "internal_transfer"}
+_CANCELLATION_EFFECTS = {"cancel", "cancelled", "cancellation", "terminate", "terminated"}
 _STATUS_RANK = {EventStatus.SETTLED: 3, EventStatus.SCHEDULED: 2, EventStatus.PENDING: 1, None: 0}
 
 
@@ -68,7 +69,7 @@ def _stream_event(fact: EvidenceFact, user_id: str, position: int) -> FinancialE
     return FinancialEvent(
         event_id=f"evidence:{fact.evidence_id}:{position}", user_id=user_id,
         event_type="income" if fact.direction == "credit" else "expense",
-        description=fact.description or ("Terminal stream evidence" if terminal else "Evidence stream update"),
+        description=fact.description or fact.stream_key or ("Terminal stream evidence" if terminal else "Evidence stream update"),
         category=fact.category, direction=fact.direction, amount=fact.amount,
         currency=fact.currency or "", event_date=fact.effective_date,
         settlement_date=fact.effective_date if fact.status == EventStatus.SETTLED else None,
@@ -100,6 +101,32 @@ def _deduplicate_lifecycles(events: list[FinancialEvent]) -> tuple[FinancialEven
     return tuple(event for event in rows if event.event_id not in discarded)
 
 
+def _lifecycle_component(events: list[FinancialEvent], event_id: str) -> set[str]:
+    """Follow both directions of linked_event_id to retain a transfer pair."""
+    by_id = {event.event_id: event for event in events}
+    component, pending = set(), [event_id]
+    while pending:
+        current = pending.pop()
+        if current in component or current not in by_id:
+            continue
+        component.add(current)
+        linked = by_id[current].linked_event_id
+        if linked:
+            pending.append(linked)
+        pending.extend(event.event_id for event in events if event.linked_event_id == current)
+    return component
+
+
+def _mark_internal_transfer_pair(events: list[FinancialEvent], event_id: str) -> list[FinancialEvent]:
+    component = _lifecycle_component(events, event_id)
+    directions = {event.direction for event in events if event.event_id in component}
+    # A one-sided assertion is not enough: leave it untouched rather than
+    # inventing a debit or credit by suppressing only one side.
+    if not {"debit", "credit"}.issubset(directions):
+        return events
+    return [replace(event, event_type="internal_transfer") if event.event_id in component else event for event in events]
+
+
 def reconcile_events(events, facts) -> tuple[FinancialEvent, ...]:
     facts = tuple(facts)
     by_event: dict[str, list[tuple[int, EvidenceFact]]] = {}
@@ -107,6 +134,9 @@ def reconcile_events(events, facts) -> tuple[FinancialEvent, ...]:
         if fact.related_event_id:
             by_event.setdefault(fact.related_event_id, []).append((position, fact))
     resolved = [_apply_event_facts(event, by_event.get(event.event_id, [])) for event in events]
+    for fact in facts:
+        if fact.effect == "internal_transfer" and fact.related_event_id:
+            resolved = _mark_internal_transfer_pair(resolved, fact.related_event_id)
     # Employment, rent, and similar stream evidence often has no one-to-one
     # event row. A terminal stream fact must stop inferred recurrence as well
     # as supplied future occurrences; the supplied opening balance already
@@ -114,10 +144,10 @@ def reconcile_events(events, facts) -> tuple[FinancialEvent, ...]:
     for fact in facts:
         if fact.related_event_id is not None or fact.effect not in _CANCELLATION_EFFECTS:
             continue
-        if not fact.category or not fact.direction:
+        if not fact.category or not fact.direction or not fact.stream_key:
             continue
         resolved = [replace(event, status=EventStatus.CANCELLED)
-                    if event.category == fact.category and event.direction == fact.direction
+                    if event_stream_key(event) == fact.stream_key
                     else event for event in resolved]
     user_id = resolved[0].user_id if resolved else ""
     for position, fact in enumerate(facts):

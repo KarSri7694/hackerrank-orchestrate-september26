@@ -27,6 +27,7 @@ class JsonEvidenceCache:
             recurring=r.get("recurring"), recurrence_days=r.get("recurrence_days"),
             flexibility=r.get("flexibility", "fixed"),
             minimum_allowed_amount=Decimal(r["minimum_allowed_amount"]) if r.get("minimum_allowed_amount") is not None else None,
+            stream_key=r.get("stream_key"),
         ) for r in rows)
 
     def put(self, key: str, facts: tuple[EvidenceFact, ...]) -> None:
@@ -38,6 +39,7 @@ class JsonEvidenceCache:
             "source_type": f.source_type, "sent_at": f.sent_at.isoformat() if f.sent_at else None,
             "category": f.category, "direction": f.direction, "description": f.description,
             "recurring": f.recurring, "recurrence_days": f.recurrence_days,
+            "stream_key": f.stream_key,
             "flexibility": f.flexibility,
             "minimum_allowed_amount": str(f.minimum_allowed_amount) if f.minimum_allowed_amount is not None else None,
         } for f in facts]

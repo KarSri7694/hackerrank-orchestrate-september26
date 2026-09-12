@@ -68,6 +68,8 @@ class Application:
                 return CorrectionEvaluation(False, "correction references an unknown event", baseline_decision)
             if not fact.related_event_id and not (fact.category and fact.direction and fact.effective_date):
                 return CorrectionEvaluation(False, "stream correction lacks category, direction, or effective date", baseline_decision)
+            if fact.effect in {"terminate", "terminated"} and not fact.related_event_id and not fact.stream_key:
+                return CorrectionEvaluation(False, "stream termination lacks a stable stream identity", baseline_decision)
             if fact.direction and fact.direction not in {"credit", "debit"}:
                 return CorrectionEvaluation(False, "invalid stream direction", baseline_decision)
             if fact.status and not isinstance(fact.status, EventStatus):
@@ -96,18 +98,18 @@ class Application:
         """
         reference = next(ref for ref in raw.evidence_refs if ref.evidence_id == fact.evidence_id)
         extracted = self.evidence_service.inspect(fact.evidence_id)
+        fields = ("effect", "related_event_id", "amount", "currency", "effective_date", "status",
+                  "category", "direction", "recurring", "recurrence_days", "stream_key")
         for known in extracted:
-            if known.effect != fact.effect:
-                continue
-            if fact.related_event_id and known.related_event_id not in {None, fact.related_event_id}:
-                continue
-            if fact.amount is not None and known.amount not in {None, fact.amount}:
-                continue
-            if fact.category and known.category not in {None, fact.category}:
-                continue
-            if fact.direction and known.direction not in {None, fact.direction}:
-                continue
-            return True
+            if all(getattr(known, field) == getattr(fact, field)
+                   for field in fields if getattr(fact, field) is not None):
+                # effect is mandatory, so this branch never treats an omitted
+                # extractor field as proof for an arbitrary critic value.
+                return True
+        # Image evidence has no deterministic textual representation. It must
+        # be supported by the VLM's structured extraction above.
+        if reference.source_type == "image":
+            return False
         text = (reference.text or "").lower()
         if not text:
             return False
@@ -131,9 +133,18 @@ class Application:
         }
         if not any(word in text for word in keywords.get(fact.effect, ())):
             return False
-        if fact.amount is not None and str(fact.amount) not in text:
+        scalar_fields = {
+            "related_event_id": fact.related_event_id, "amount": str(fact.amount) if fact.amount is not None else None,
+            "currency": fact.currency, "effective_date": fact.effective_date.isoformat() if fact.effective_date else None,
+            "status": fact.status.value if fact.status else None, "category": fact.category,
+            "direction": fact.direction, "recurrence_days": str(fact.recurrence_days) if fact.recurrence_days is not None else None,
+            "stream_key": fact.stream_key,
+        }
+        if any(str(value).lower() not in text for value in scalar_fields.values() if value is not None):
             return False
-        if fact.category and fact.category.lower() not in text and fact.effect == "stream_update":
+        if fact.recurring is True and not any(word in text for word in ("recurring", "monthly", "weekly", "every ")):
+            return False
+        if fact.recurring is False and not any(word in text for word in ("one-time", "one time", "not recurring")):
             return False
         return True
 

@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 import calendar
+import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 
 from .domain import EventStatus, FinancialEvent
+
+
+def stream_key(category: str, direction: str, description: str | None) -> str:
+    """Stable, deterministic stream identity; category alone is insufficient."""
+    source = re.sub(r"\b(final|last|ended|terminated)\b", "", (description or "").lower())
+    source = re.sub(r"[^a-z0-9]+", " ", source).strip()
+    return "|".join((category.strip().lower(), direction.strip().lower(), source))
+
+
+def event_stream_key(event: FinancialEvent) -> str:
+    return stream_key(event.category, event.direction, event.description)
 
 
 @dataclass(frozen=True)
@@ -34,7 +46,7 @@ def _stable_stream(values: list[FinancialEvent], minimum: int) -> RecurringStrea
 
 def detect_recurrences(events) -> tuple[RecurringStream, ...]:
     eligible = [event for event in events if event.status == EventStatus.SETTLED and event.amount is not None]
-    terminal = {(event.category, event.direction) for event in events if event.status == EventStatus.CANCELLED or any(word in event.description.lower() for word in ("final", "last", "ended", "end of", "terminated", "terminal stream"))}
+    terminal = {event_stream_key(event) for event in events if event.status == EventStatus.CANCELLED or any(word in event.description.lower() for word in ("final", "last", "ended", "end of", "terminated", "terminal stream"))}
     exact: dict[tuple[str, str, str], list[FinancialEvent]] = {}
     by_category: dict[tuple[str, str], list[FinancialEvent]] = {}
     for event in eligible:
@@ -43,14 +55,15 @@ def detect_recurrences(events) -> tuple[RecurringStream, ...]:
     streams: list[RecurringStream] = []
     covered_categories: set[tuple[str, str]] = set()
     for key, values in exact.items():
-        if (key[0], key[2]) in terminal:
+        if stream_key(key[0], key[2], key[1]) in terminal:
             continue
         stream = _stable_stream(values, 3)
         if stream:
             streams.append(stream)
             covered_categories.add((key[0], key[2]))
     for key, values in by_category.items():
-        if key in terminal or key in covered_categories or len({event.description for event in values}) < 2:
+        values = [event for event in values if event_stream_key(event) not in terminal]
+        if key in covered_categories or len({event.description for event in values}) < 2:
             continue
         stream = _stable_stream(values, 4)
         if stream:
@@ -59,9 +72,14 @@ def detect_recurrences(events) -> tuple[RecurringStream, ...]:
     for override in overrides:
         for index, stream in enumerate(streams):
             representative = stream.representative
-            if (representative.category, representative.direction) == (override.category, override.direction):
+            if event_stream_key(representative) == event_stream_key(override):
                 streams[index] = RecurringStream(override, override.recurrence_days or stream.cadence_days)
                 break
+        else:
+            # A stream explicitly marked recurring by evidence needs no
+            # historical rows. One-time evidence uses recurrence_days=0 and
+            # is deliberately excluded above.
+            streams.append(RecurringStream(override, override.recurrence_days or 30))
     return tuple(streams)
 
 

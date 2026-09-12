@@ -132,6 +132,7 @@ class EvidenceFact:
     recurrence_days: int | None = None
     flexibility: str = "fixed"
     minimum_allowed_amount: Decimal | None = None
+    stream_key: str | None = None
 
 
 @dataclass(frozen=True)
