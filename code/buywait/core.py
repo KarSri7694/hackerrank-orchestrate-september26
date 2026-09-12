@@ -128,7 +128,15 @@ def baseline(ctx: RequestContext, fx) -> tuple[Decimal, date | None]:
 
 def expand_option(option) -> tuple[Payment, ...]:
     frequency = option.payment_frequency_days or 0
+    if option.number_of_payments < 1 or (option.number_of_payments > 1 and frequency <= 0):
+        return ()
     return tuple(Payment(option.first_payment_date + timedelta(days=frequency * i), option.payment_amount) for i in range(option.number_of_payments))
+
+
+def _calendar_months_between(start: date, end: date) -> int:
+    """Return elapsed calendar months, charging a partial month as a month."""
+    months = (end.year - start.year) * 12 + end.month - start.month
+    return months + (1 if end.day > start.day else 0)
 
 
 def legal_changes(ctx: RequestContext, events: list[FinancialEvent], maximum: int = 3) -> list[tuple[SpendingChange, ...]]:
@@ -169,11 +177,15 @@ def solve(ctx: RequestContext, fx) -> DecisionCore:
             if option.payment_method != PaymentMethod.INSTALLMENTS:
                 continue
             payments = expand_option(option)
-            months = (payments[-1].date - payments[0].date).days / 30 if payments else 0
-            if (ctx.profile.max_installment_months is None or months <= ctx.profile.max_installment_months) and payments[-1].date <= req.desired_completion_date:
+            if not payments or payments[0].date < req.request_date or payments[-1].date > req.desired_completion_date:
+                continue
+            months = _calendar_months_between(payments[0].date, payments[-1].date)
+            if ctx.profile.max_installment_months is None or months <= ctx.profile.max_installment_months:
                 candidates.append(PlanCandidate(PaymentMethod.INSTALLMENTS, payments, option.total_payable_amount, payment_option_id=option.payment_option_id))
     if PaymentMethod.FULL in ctx.profile.accepted_payment_methods and earliest and earliest > req.request_date and earliest <= req.desired_completion_date:
         candidates.append(PlanCandidate(PaymentMethod.WAIT, (Payment(earliest, req.requested_amount),), req.requested_amount))
+    # Candidate generation is permissive; only simulator-safe schedules may
+    # enter ranking, including full, partial, wait, and installments.
     safe_candidates = [c for c in candidates if simulate(ctx, fx, c.payments).safe]
     if not safe_candidates:
         for candidate in candidates:
