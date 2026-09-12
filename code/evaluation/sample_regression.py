@@ -156,9 +156,9 @@ def _field_category(field: str, expected: str, actual: str) -> str:
     return "PLAN_RANKING"
 
 
-def evaluate_samples(dataset_dir: str | Path) -> tuple[SampleResult, ...]:
+def evaluate_samples(dataset_dir: str | Path, evidence_extractor=None) -> tuple[SampleResult, ...]:
     dataset_dir = Path(dataset_dir)
-    app = Application(dataset_dir)
+    app = Application(dataset_dir, evidence_extractor=evidence_extractor)
     with (dataset_dir / "sample_requests.csv").open(newline="", encoding="utf-8-sig") as handle:
         rows = list(csv.DictReader(handle))
     # The public samples have their own request IDs and are intentionally not
@@ -231,7 +231,13 @@ def print_report(results: tuple[SampleResult, ...]) -> None:
 
 def main() -> None:
     root = Path(__file__).resolve().parents[2]
-    print_report(evaluate_samples(root / "dataset"))
+    extractor = None
+    from agent.config import AgentConfig
+    config = AgentConfig.from_dotenv(root / ".env")
+    if config.ai_mode != "disabled" and config.api_key:
+        from agent.evidence_extractor import OpenAIEvidenceExtractor
+        extractor = OpenAIEvidenceExtractor(config)
+    print_report(evaluate_samples(root / "dataset", evidence_extractor=extractor))
 
 
 if __name__ == "__main__":

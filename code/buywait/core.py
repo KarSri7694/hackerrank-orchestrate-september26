@@ -1,24 +1,18 @@
 from __future__ import annotations
 
-import calendar
+import re
 from collections import defaultdict
 from datetime import date, timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from itertools import combinations
 
 from .domain import (AffordabilityStatus, DecisionCore, EventStatus, FinancialEvent,
                      Payment, PaymentMethod, PlanCandidate, RequestContext,
                      SimulationResult, SpendingChange)
 from .reconciliation import reconcile_context
+from .recurrence import detect_recurrences, recurring_event_ids
 
 ZERO = Decimal("0")
-
-
-def _add_months(day: date, months: int = 1) -> date:
-    month_index = day.year * 12 + day.month - 1 + months
-    year, month_index = divmod(month_index, 12)
-    month = month_index + 1
-    return date(year, month, min(day.day, calendar.monthrange(year, month)[1]))
 
 
 def _cash(event: FinancialEvent, home_currency: str, fx, on_date: date) -> Decimal:
@@ -38,34 +32,15 @@ def _effective_events(ctx: RequestContext, fx) -> list[tuple[date, Decimal, str,
         if event.status == EventStatus.PENDING and event.direction == "credit":
             continue
         event_day = event.settlement_date or event.event_date
+        if event.status == EventStatus.PENDING and event.direction == "debit" and event.settlement_date is None and event_day < request_date:
+            event_day = request_date
         if event_day >= request_date and event_day <= end:
             rows.append((event_day, _cash(event, ctx.profile.home_currency, fx, event_day), event.event_id, event))
-    # Infer recurrence only from stable monthly histories. Irregular variable
-    # spending must not become a fabricated recurring obligation.
-    groups: dict[tuple[str, str, str], list[FinancialEvent]] = defaultdict(list)
-    terminal_streams: set[tuple[str, str]] = set()
-    for event in ctx.events:
-        if event.status == EventStatus.SETTLED and event.amount is not None:
-            groups[(event.category, event.description, event.direction)].append(event)
-            if any(word in event.description.lower() for word in ("final", "last", "ended", "end of", "terminated")):
-                terminal_streams.add((event.category, event.direction))
-    for group in groups.values():
-        ordered = sorted(group, key=lambda e: e.event_date)
-        if len(ordered) < 3:
-            continue
-        gaps = [(b.event_date - a.event_date).days for a, b in zip(ordered, ordered[1:])]
-        sorted_gaps = sorted(gaps)
-        median_gap = sorted_gaps[len(sorted_gaps) // 2]
-        if median_gap < 25 or median_gap > 35 or any(abs(gap - median_gap) > 3 for gap in gaps):
-            continue
-        last = ordered[-1]
-        # A terminal payroll/contract record is evidence that the historical
-        # stream has ended.  Do not manufacture income after a final event.
-        if (last.category, last.direction) in terminal_streams:
-            continue
-        next_day = last.event_date
+    for stream in detect_recurrences(ctx.events):
+        last = stream.representative
+        next_day = last.settlement_date or last.event_date
         while next_day < request_date:
-            next_day = _add_months(next_day)
+            next_day = stream.next_date(next_day)
         while next_day <= end:
             # An explicit event on the same date wins over an inferred one;
             # descriptions can differ when a bank/payroll system changes its
@@ -73,7 +48,7 @@ def _effective_events(ctx: RequestContext, fx) -> list[tuple[date, Decimal, str,
             same_stream_exists = any(x[0] == next_day and x[3].category == last.category and x[3].direction == last.direction for x in rows)
             if not same_stream_exists:
                 rows.append((next_day, _cash(last, ctx.profile.home_currency, fx, next_day), last.event_id, last))
-            next_day = _add_months(next_day)
+            next_day = stream.next_date(next_day)
     return rows
 
 
@@ -86,8 +61,34 @@ def _change_amount(event: FinancialEvent, change: SpendingChange, fx, home: str,
     return fx.convert(change.new_amount, event.currency, home, on_date)
 
 
+def validate_changes(ctx: RequestContext, changes: tuple[SpendingChange, ...]) -> None:
+    if len(changes) > 3 or len({change.event_id for change in changes}) != len(changes):
+        raise ValueError("at most three unique spending changes are allowed")
+    events = {event.event_id: event for event in ctx.events}
+    recurring = recurring_event_ids(ctx.events)
+    for change in changes:
+        event = events.get(change.event_id)
+        if event is None or event.event_id not in recurring or event.direction != "debit":
+            raise ValueError(f"event is not a recurring debit: {change.event_id}")
+        if event.flexibility == "fixed" or event.category in ctx.profile.protected_categories:
+            raise ValueError(f"event is not a legal flexible target: {change.event_id}")
+        if change.action == "stop":
+            if event.category not in ctx.profile.stoppable_categories or event.flexibility not in {"stoppable", "reducible_or_stoppable"} or change.new_amount is not None:
+                raise ValueError(f"stop is not allowed: {change.event_id}")
+        elif change.action == "reduce_to":
+            minimum = event.minimum_allowed_amount or ZERO
+            current = abs(event.amount or ZERO)
+            if event.category not in ctx.profile.reducible_categories or event.flexibility not in {"reducible", "reducible_or_stoppable"}:
+                raise ValueError(f"reduction is not allowed: {change.event_id}")
+            if change.new_amount is None or not minimum <= change.new_amount <= current:
+                raise ValueError(f"reduced amount is outside legal bounds: {change.event_id}")
+        else:
+            raise ValueError(f"unsupported spending change action: {change.action}")
+
+
 def simulate(ctx: RequestContext, fx, payments: tuple[Payment, ...] = (), changes: tuple[SpendingChange, ...] = ()) -> SimulationResult:
     ctx = reconcile_context(ctx)
+    validate_changes(ctx, changes)
     changes_by_id = {c.event_id: c for c in changes}
     timeline = _effective_events(ctx, fx)
     balances = ctx.profile.current_available_balance
@@ -141,44 +142,22 @@ def _calendar_months_between(start: date, end: date) -> int:
     return months + (1 if end.day > start.day else 0)
 
 
+def _option_order(option_id: str | None) -> tuple[int, str]:
+    if not option_id:
+        return 10**12, ""
+    match = re.search(r"(\d+)$", option_id)
+    return (int(match.group(1)) if match else 10**12, option_id)
+
+
 def legal_changes(ctx: RequestContext, events: list[FinancialEvent], maximum: int = 3) -> list[tuple[SpendingChange, ...]]:
     ctx = reconcile_context(ctx)
-    # A recurring obligation is represented by its latest settled event.  The
-    # old implementation exposed every historical installment as a separate
-    # target, creating duplicate interventions and allowing changes that could
-    # not affect the forecast.
-    events = list(ctx.events)
-    latest: dict[tuple[str, str, str], FinancialEvent] = {}
-    history: dict[tuple[str, str, str], list[FinancialEvent]] = defaultdict(list)
-    for event in events:
-        if event.status == EventStatus.SETTLED and event.direction == "debit" and event.flexibility != "fixed":
-            history[(event.category, event.description, event.direction)].append(event)
-    recurring: list[FinancialEvent] = []
-    for key, values in history.items():
-        ordered = sorted(values, key=lambda e: e.event_date)
-        if len(ordered) < 3:
-            continue
-        gaps = [(b.event_date - a.event_date).days for a, b in zip(ordered, ordered[1:])]
-        median = sorted(gaps)[len(gaps) // 2]
-        if 5 <= median <= 35 and all(abs(gap - median) <= 3 for gap in gaps):
-            recurring.append(ordered[-1])
-    # Also support variable recurring categories whose descriptions rotate.
-    by_category: dict[tuple[str, str], list[FinancialEvent]] = defaultdict(list)
-    for event in events:
-        if event.status == EventStatus.SETTLED and event.direction == "debit" and event.flexibility != "fixed":
-            by_category[(event.category, event.direction)].append(event)
-    for key, values in by_category.items():
-        ordered = sorted(values, key=lambda e: e.event_date)
-        if len(ordered) < 4:
-            continue
-        gaps = [(b.event_date - a.event_date).days for a, b in zip(ordered, ordered[1:])]
-        median = sorted(gaps)[len(gaps) // 2]
-        if 5 <= median <= 35 and all(abs(gap - median) <= 3 for gap in gaps):
-            recurring.append(ordered[-1])
-    for event in recurring:
-        latest[(event.category, event.description, event.direction)] = event
+    event_by_id = {event.event_id: event for event in ctx.events}
+    recurring_ids = recurring_event_ids(ctx.events)
     candidates: list[tuple[SpendingChange, ...]] = [()]
-    for event in latest.values():
+    for event_id in sorted(recurring_ids):
+        event = event_by_id[event_id]
+        if event.direction != "debit" or event.flexibility == "fixed":
+            continue
         if event.category in ctx.profile.protected_categories:
             continue
         options: list[SpendingChange] = []
@@ -226,18 +205,44 @@ def _optimized_changes(ctx: RequestContext, fx, payments: tuple[Payment, ...], m
                 low = mid
             else:
                 high = mid
-        refined.append(SpendingChange(change.event_id, "reduce_to", low.quantize(Decimal("0.01"))))
+        refined.append(SpendingChange(change.event_id, "reduce_to", low.quantize(Decimal("0.01"), rounding=ROUND_DOWN)))
     options = refined
     safe: list[tuple[tuple[Decimal, int, tuple[str, ...]], tuple[SpendingChange, ...]]] = []
     for size in range(1, maximum + 1):
         for group in combinations(options, size):
             if len({change.event_id for change in group}) != size:
                 continue
-            if simulate(ctx, fx, payments, tuple(group)).safe:
-                reduction = sum((abs(next(e for e in ctx.events if e.event_id == c.event_id).amount or ZERO) - (c.new_amount or ZERO)) for c in group)
-                safe.append(((reduction, size, tuple(c.event_id for c in group)), tuple(group)))
-        if safe:
-            break
+            adjusted = list(group)
+            if not simulate(ctx, fx, payments, tuple(adjusted)).safe:
+                continue
+            # A reduction may need a companion change to become safe. Once a
+            # safe combination exists, relax every reduction upward while the
+            # complete combination remains safe.
+            for index, change in enumerate(adjusted):
+                if change.action != "reduce_to":
+                    continue
+                event = next(e for e in ctx.events if e.event_id == change.event_id)
+                low, high = change.new_amount or ZERO, abs(event.amount or ZERO)
+                for _ in range(40):
+                    if high - low <= Decimal("0.01"):
+                        break
+                    mid = (low + high) / 2
+                    probe = list(adjusted)
+                    probe[index] = SpendingChange(change.event_id, "reduce_to", mid)
+                    if simulate(ctx, fx, payments, tuple(probe)).safe:
+                        low = mid
+                    else:
+                        high = mid
+                adjusted[index] = SpendingChange(change.event_id, "reduce_to", low.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+            adjusted_tuple = tuple(adjusted)
+            if not simulate(ctx, fx, payments, adjusted_tuple).safe:
+                continue
+            reduction = ZERO
+            for change in adjusted_tuple:
+                event = next(e for e in ctx.events if e.event_id == change.event_id)
+                reduced = ZERO if change.action == "stop" else (change.new_amount or ZERO)
+                reduction += fx.convert(abs(event.amount or ZERO) - reduced, event.currency, ctx.profile.home_currency, ctx.request.request_date)
+            safe.append(((reduction, size, tuple(c.event_id for c in adjusted_tuple)), adjusted_tuple))
     return list(sorted(safe, key=lambda item: item[0])[0][1]) if safe else None
 
 
@@ -273,7 +278,7 @@ def solve(ctx: RequestContext, fx) -> DecisionCore:
     if not safe_candidates:
         return DecisionCore(req.request_id, safe_today, AffordabilityStatus.NOT_AFFORDABLE, PaymentMethod.NOT_RECOMMENDED, (), earliest, (), {"minimum_balance": str(ctx.profile.minimum_balance_to_keep)})
     def rank(c: PlanCandidate):
-        return (0 if c.payments[-1].date <= req.desired_completion_date else 1, 0 if not c.spending_changes else 1, c.total_payable, c.payments[0].date, len(c.payments), c.payment_option_id or "")
+        return (0 if c.payments[-1].date <= req.desired_completion_date else 1, 0 if not c.spending_changes else 1, c.total_payable, c.payments[0].date, len(c.payments), _option_order(c.payment_option_id))
     winner = sorted(safe_candidates, key=rank)[0]
     status = AffordabilityStatus.NOW if winner.method == PaymentMethod.FULL and winner.payments[0].date == req.request_date and not winner.spending_changes else AffordabilityStatus.LATER if winner.method == PaymentMethod.WAIT else AffordabilityStatus.WITH_PLAN
     return DecisionCore(req.request_id, safe_today, status, winner.method, winner.payments, earliest, winner.spending_changes, {"minimum_balance": str(ctx.profile.minimum_balance_to_keep), "winner_total": str(winner.total_payable)})

@@ -23,6 +23,12 @@ app = Application(_dataset_dir())
 mcp = FastMCP("buy-or-wait")
 
 
+def configure_application(application: Application) -> None:
+    """Bind MCP tools to the same application state used by the agent."""
+    global app
+    app = application
+
+
 @mcp.tool
 def get_case(request_id: str) -> dict[str, object]:
     """Return reconstructed financial state and baseline affordability for a request."""
@@ -33,12 +39,16 @@ def get_case(request_id: str) -> dict[str, object]:
 def inspect_evidence(evidence_id: str) -> list[dict[str, object]]:
     """Return structured facts from one relevant message or image."""
     ref = app.repository.evidence(evidence_id)
-    return {"evidence_id": evidence_id, "source_type": ref.source_type, "text": ref.text,
+    return {"evidence_id": evidence_id, "source_type": ref.source_type,
+            "sent_at": ref.sent_at.isoformat() if ref.sent_at else None, "text": ref.text,
             "image_available": bool(ref.image_path), "facts": [
                 {"evidence_id": f.evidence_id, "effect": f.effect, "related_event_id": f.related_event_id,
                  "amount": str(f.amount) if f.amount is not None else None, "currency": f.currency,
                  "effective_date": f.effective_date.isoformat() if f.effective_date else None,
-                 "status": f.status.value if f.status else None, "confidence": f.confidence}
+                "status": f.status.value if f.status else None, "confidence": f.confidence,
+                 "source_type": f.source_type, "sent_at": f.sent_at.isoformat() if f.sent_at else None,
+                 "category": f.category, "direction": f.direction, "description": f.description,
+                 "recurring": f.recurring, "recurrence_days": f.recurrence_days}
                 for f in app.evidence_service.inspect(evidence_id)]}
 
 

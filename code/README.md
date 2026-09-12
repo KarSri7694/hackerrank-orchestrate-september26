@@ -3,7 +3,8 @@
 The implementation uses a hexagonal architecture:
 
 - `buywait/domain.py` contains framework-independent domain models.
-- `buywait/core.py` contains deterministic reconciliation, forecasting, simulation, plan generation, and ranking.
+- `buywait/reconciliation.py` and `buywait/recurrence.py` reconstruct lifecycle/evidence state and recurring streams.
+- `buywait/core.py` contains deterministic forecasting, simulation, optimization, plan generation, and ranking.
 - `buywait/application.py` exposes use cases over repository and exchange-rate ports.
 - `buywait/adapters/` contains CSV, FX, cache, and evidence adapters.
 - `tools/server.py` is the FastMCP inbound adapter.
@@ -32,7 +33,7 @@ Copy-Item .env.example .env
 python code/main.py
 ```
 
-Configuration is loaded from `.env` with `python-dotenv`. `OPENAI_BASE_URL` supports compatible OpenAI-style endpoints. The runner defaults to four turns and eight tool calls, sends only relevant local evidence images as base64 `input_image` parts, and falls back to deterministic solving in `auto` mode.
+Configuration is loaded from `.env` with `python-dotenv`. `OPENAI_BASE_URL` supports compatible OpenAI-style endpoints. When a key is configured, the evidence extractor converts relevant messages and images into structured event/stream facts before every application use case; deterministic Python then reconciles and verifies the result. The runner defaults to four turns and eight tool calls and falls back to deterministic solving in `auto` mode.
 
 `fastmcp` is declared in the repository-level `requirements.txt`.
 
@@ -42,4 +43,4 @@ Run the sample regression evaluator:
 python code/evaluation/main.py --samples
 ```
 
-It runs the current deterministic solver over every row in `sample_requests.csv`, compares the six labeled fields semantically, prints per-field and overall accuracy, and prints expected-versus-actual diffs for failures with a likely failure category. It does not alter solver logic or hardcode sample request IDs.
+It uses the same application and evidence-aware reconciliation path as production, compares the six labeled fields semantically, and prints expected-versus-actual diffs. With no API key, evidence extraction is intentionally empty; with a configured key, message and image facts are extracted before evaluation.

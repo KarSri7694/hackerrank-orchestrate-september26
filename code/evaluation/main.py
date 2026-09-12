@@ -19,7 +19,13 @@ def main() -> None:
     args = parser.parse_args()
     root = CODE_DIR.parent
     if args.samples:
-        print_report(evaluate_samples(root / "dataset"))
+        extractor = None
+        from agent.config import AgentConfig
+        config = AgentConfig.from_dotenv(root / ".env")
+        if config.ai_mode != "disabled" and config.api_key:
+            from agent.evidence_extractor import OpenAIEvidenceExtractor
+            extractor = OpenAIEvidenceExtractor(config)
+        print_report(evaluate_samples(root / "dataset", evidence_extractor=extractor))
         return
     app = Application(root / "dataset")
     for request_id in app.repository.request_ids():

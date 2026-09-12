@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -22,6 +22,11 @@ def _date(value: str | None) -> date | None:
 def _decimal(value: str | None) -> Decimal | None:
     value = _text(value)
     return Decimal(value) if value else None
+
+
+def _datetime(value: str | None) -> datetime | None:
+    value = _text(value)
+    return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
 
 
 def _bool(value: str | None) -> bool:
@@ -94,11 +99,19 @@ class CsvRepository:
             self.options_by_request[option.request_id].append(option)
         self.evidence_refs: dict[str, EvidenceReference] = {}
         for r in messages:
-            ref = EvidenceReference(_text(r["message_id"]), _text(r["source_type"]), _text(r["user_id"]), _text(r["request_id"]) or None, _text(r["related_event_id"]) or None, _text(r["message_text"]) or None, None)
+            ref = EvidenceReference(
+                evidence_id=_text(r["message_id"]), source_type=_text(r["source_type"]), user_id=_text(r["user_id"]),
+                request_id=_text(r["request_id"]) or None, related_event_id=_text(r["related_event_id"]) or None,
+                text=_text(r["message_text"]) or None, sent_at=_datetime(r.get("sent_at")),
+            )
             self.evidence_refs[ref.evidence_id] = ref
         for r in images:
             image_path = root / "media" / "images" / f"{_text(r['image_id'])}.png"
-            ref = EvidenceReference(_text(r["image_id"]), "image", _text(r["user_id"]), _text(r["request_id"]) or None, _text(r["related_event_id"]) or None, None, str(image_path))
+            ref = EvidenceReference(
+                evidence_id=_text(r["image_id"]), source_type="image", user_id=_text(r["user_id"]),
+                request_id=_text(r["request_id"]) or None, related_event_id=_text(r["related_event_id"]) or None,
+                image_path=str(image_path),
+            )
             self.evidence_refs[ref.evidence_id] = ref
         self.evidence_by_user: dict[str, list[EvidenceReference]] = defaultdict(list)
         for ref in self.evidence_refs.values():

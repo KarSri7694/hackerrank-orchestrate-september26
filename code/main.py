@@ -10,13 +10,18 @@ from buywait.application import Application
 def main() -> None:
     """Run the deterministic solver and print structured decisions for manual export."""
     root = Path(__file__).resolve().parents[1]
-    app = Application(root / "dataset")
     config = AgentConfig.from_dotenv(root / ".env")
+    extractor = None
+    if config.ai_mode != "disabled" and config.api_key:
+        from agent.evidence_extractor import OpenAIEvidenceExtractor
+        extractor = OpenAIEvidenceExtractor(config)
+    app = Application(root / "dataset", evidence_extractor=extractor)
     runner = None
     if config.ai_mode != "disabled":
-        from tools.server import mcp
+        from tools import server
         from agent.runner import AgentRunner
-        runner = AgentRunner(app, mcp, root / "dataset", config=config)
+        server.configure_application(app)
+        runner = AgentRunner(app, server.mcp, root / "dataset", config=config)
     for request_id in app.repository.request_ids():
         decision = (runner.run(request_id).decision if runner else app.decision(request_id))
         print(json.dumps({

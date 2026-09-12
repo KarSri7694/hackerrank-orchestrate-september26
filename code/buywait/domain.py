@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 
@@ -72,6 +72,7 @@ class FinancialEvent:
     linked_event_id: str | None
     flexibility: str
     minimum_allowed_amount: Decimal | None
+    recurrence_days: int | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ class EvidenceReference:
     related_event_id: str | None = None
     text: str | None = None
     image_path: str | None = None
+    sent_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +123,15 @@ class EvidenceFact:
     effective_date: date | None = None
     status: EventStatus | None = None
     confidence: float = 1.0
+    source_type: str | None = None
+    sent_at: datetime | None = None
+    category: str | None = None
+    direction: str | None = None
+    description: str | None = None
+    recurring: bool | None = None
+    recurrence_days: int | None = None
+    flexibility: str = "fixed"
+    minimum_allowed_amount: Decimal | None = None
 
 
 @dataclass(frozen=True)

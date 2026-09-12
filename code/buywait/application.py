@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .adapters.csv_repository import CsvRepository
 from .adapters.exchange_rates import CsvExchangeRates
-from .core import _optimized_changes, baseline, simulate, solve
+from .core import _optimized_changes, baseline, simulate, solve, validate_changes
 from .domain import EvidenceFact, Payment, SpendingChange
 from .evidence import EvidenceService
 from .reconciliation import reconcile_context
@@ -16,17 +16,19 @@ from .reconciliation import reconcile_context
 class Application:
     """Inbound application services used by CLI and MCP adapters."""
 
-    def __init__(self, dataset_dir: str | Path):
+    def __init__(self, dataset_dir: str | Path, evidence_extractor=None):
         self.repository = CsvRepository(dataset_dir)
         self.fx = CsvExchangeRates(Path(dataset_dir) / "exchange_rates.csv")
-        self.evidence_service = EvidenceService(self.repository)
+        self.evidence_service = EvidenceService(self.repository, evidence_extractor)
 
     def _context(self, request_id: str):
-        return self.repository.context(request_id)
+        raw = self.repository.context(request_id)
+        facts = self.evidence_service.facts_for(raw.evidence_refs)
+        return reconcile_context(replace(raw, evidence_facts=facts))
 
     def context_with_evidence(self, request_id: str, facts: tuple[EvidenceFact, ...]):
-        ctx = self.repository.context(request_id)
-        return reconcile_context(replace(ctx, evidence_facts=tuple(facts)))
+        self.evidence_service.register(facts)
+        return self._context(request_id)
 
     def decision_with_evidence(self, request_id: str, facts: tuple[EvidenceFact, ...]):
         """Run the complete deterministic decision flow on resolved events."""
@@ -43,12 +45,14 @@ class Application:
             "user_id": ctx.request.user_id,
             "request_date": ctx.request.request_date.isoformat(),
             "request_type": ctx.request.request_type,
+            "request_text": ctx.request.request_text,
             "requested_amount": str(ctx.request.requested_amount),
             "desired_completion_date": ctx.request.desired_completion_date.isoformat(),
             "allows_partial_payment": ctx.request.allows_partial_payment,
             "home_currency": ctx.profile.home_currency,
             "current_available_balance": str(ctx.profile.current_available_balance),
             "minimum_balance_to_keep": str(ctx.profile.minimum_balance_to_keep),
+            "financial_priorities": list(ctx.profile.financial_priorities),
             "accepted_payment_methods": sorted(x.value for x in ctx.profile.accepted_payment_methods),
             "max_installment_months": ctx.profile.max_installment_months,
             "amount_safe_to_pay": str(safe),
@@ -63,10 +67,15 @@ class Application:
                 "financing_fee": str(o.financing_fee),
                 "total_payable_amount": str(o.total_payable_amount),
             } for o in ctx.payment_options],
-            "evidence_refs": [r.__dict__ for r in ctx.evidence_refs],
+            "evidence_refs": [{
+                "evidence_id": r.evidence_id, "source_type": r.source_type,
+                "request_id": r.request_id, "related_event_id": r.related_event_id,
+                "sent_at": r.sent_at.isoformat() if r.sent_at else None,
+                "has_text": bool(r.text), "image_available": bool(r.image_path),
+            } for r in ctx.evidence_refs],
         }
 
-    def simulate_plan(self, request_id: str, payments: tuple[Payment, ...], changes: tuple[SpendingChange, ...]):
+    def simulate_plan(self, request_id: str, payments: tuple[Payment, ...], changes: tuple[SpendingChange, ...] = ()):
         ctx = self._context(request_id)
         self._validate_changes(ctx, changes)
         return simulate(ctx, self.fx, payments, changes)
@@ -78,10 +87,4 @@ class Application:
         return {"possible": bool(changes is not None and result.safe), "spending_changes": [c.__dict__ for c in changes or ()], "minimum_projected_balance": str(result.minimum_projected_balance)}
 
     def _validate_changes(self, ctx, changes: tuple[SpendingChange, ...]):
-        if len(changes) > 3 or len({c.event_id for c in changes}) != len(changes):
-            raise ValueError("at most three spending changes are allowed and event IDs must be unique")
-        events = {e.event_id: e for e in ctx.events}
-        for change in changes:
-            event = events.get(change.event_id)
-            if event is None or event.flexibility == "fixed" or event.category in ctx.profile.protected_categories:
-                raise ValueError(f"event is not a legal flexible spending target: {change.event_id}")
+        validate_changes(ctx, changes)

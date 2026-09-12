@@ -1,64 +1,116 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
+from decimal import Decimal
 
 from .domain import EventStatus, EvidenceFact, FinancialEvent
 
+_AMENDMENT_EFFECTS = {"amend", "amendment", "amount_amendment", "date_amendment", "delay", "delayed", "confirm", "confirmed", "add_fact", "settle", "settled", "image_amount", "stream_update"}
+_CANCELLATION_EFFECTS = {"cancel", "cancelled", "cancellation", "terminate", "terminated"}
+_STATUS_RANK = {EventStatus.SETTLED: 3, EventStatus.SCHEDULED: 2, EventStatus.PENDING: 1, None: 0}
 
-_AMENDMENT_EFFECTS = {"amend", "amendment", "amount_amendment", "date_amendment", "delay", "delayed", "confirm", "confirmed", "add_fact", "settle", "settled", "image_amount"}
-_CANCELLATION_EFFECTS = {"cancel", "cancelled", "cancellation"}
+
+def _timestamp(fact: EvidenceFact) -> tuple[int, int, int, int, int, int, int]:
+    value = fact.sent_at or datetime.min
+    return value.year, value.month, value.day, value.hour, value.minute, value.second, value.microsecond
 
 
-def _fact_rank(fact: EvidenceFact, position: int) -> tuple[int, float, int]:
-    """Rank explicit evidence deterministically; position breaks same-confidence ties."""
+def _rank(fact: EvidenceFact, event: FinancialEvent, field: str, position: int):
     explicit = 3 if fact.effect in _CANCELLATION_EFFECTS else 2 if fact.effect in _AMENDMENT_EFFECTS else 1
-    return explicit, fact.confidence, position
+    settled = _STATUS_RANK.get(fact.status, 0)
+    safer = Decimal("0")
+    if field == "amount" and fact.amount is not None:
+        safer = fact.amount if event.direction == "debit" else -fact.amount
+    if field == "date" and fact.effective_date is not None:
+        ordinal = Decimal(fact.effective_date.toordinal())
+        safer = -ordinal if event.direction == "debit" else ordinal
+    return explicit, settled, safer, fact.confidence, position
 
 
-def reconcile_events(events: tuple[FinancialEvent, ...] | list[FinancialEvent], facts: tuple[EvidenceFact, ...] | list[EvidenceFact]) -> tuple[FinancialEvent, ...]:
-    """Apply structured evidence to raw events without doing financial arithmetic.
+def _pick(items, event: FinancialEvent, field: str):
+    if not items:
+        return None
+    newest_by_source: dict[str, tuple[int, EvidenceFact]] = {}
+    for item in items:
+        source = item[1].source_type or item[1].evidence_id
+        current = newest_by_source.get(source)
+        if current is None or (_timestamp(item[1]), item[0]) > (_timestamp(current[1]), current[0]):
+            newest_by_source[source] = item
+    return max(newest_by_source.values(), key=lambda item: _rank(item[1], event, field, item[0]))[1]
 
-    Evidence is scoped to an existing event. Explicit cancellation wins over
-    all other facts for that event. Amount/date/status amendments are selected
-    by explicit-effect priority, confidence, then stable input order.
-    """
+
+def _apply_event_facts(event: FinancialEvent, related: list[tuple[int, EvidenceFact]]) -> FinancialEvent:
+    if not related:
+        return event
+    if any(f.effect in _CANCELLATION_EFFECTS or f.status == EventStatus.CANCELLED for _, f in related):
+        return replace(event, status=EventStatus.CANCELLED)
+    amount_fact = _pick([item for item in related if item[1].amount is not None], event, "amount")
+    date_fact = _pick([item for item in related if item[1].effective_date is not None], event, "date")
+    status_fact = _pick([item for item in related if item[1].status is not None], event, "status")
+    updated = event
+    if amount_fact:
+        updated = replace(updated, amount=amount_fact.amount, currency=amount_fact.currency or updated.currency)
+    if date_fact:
+        updated = replace(updated, event_date=date_fact.effective_date, settlement_date=date_fact.effective_date)
+    if status_fact:
+        updated = replace(updated, status=status_fact.status)
+    return updated
+
+
+def _stream_event(fact: EvidenceFact, user_id: str, position: int) -> FinancialEvent | None:
+    if not fact.category or not fact.direction or not fact.effective_date:
+        return None
+    terminal = fact.effect in _CANCELLATION_EFFECTS
+    return FinancialEvent(
+        event_id=f"evidence:{fact.evidence_id}:{position}", user_id=user_id,
+        event_type="income" if fact.direction == "credit" else "expense",
+        description=fact.description or ("Terminal stream evidence" if terminal else "Evidence stream update"),
+        category=fact.category, direction=fact.direction, amount=fact.amount,
+        currency=fact.currency or "", event_date=fact.effective_date,
+        settlement_date=fact.effective_date if fact.status == EventStatus.SETTLED else None,
+        status=EventStatus.CANCELLED if terminal else (fact.status or EventStatus.SCHEDULED),
+        linked_event_id=None, flexibility=fact.flexibility or "fixed",
+        minimum_allowed_amount=fact.minimum_allowed_amount,
+        recurrence_days=0 if fact.recurring is False else fact.recurrence_days,
+    )
+
+
+def _deduplicate_lifecycles(events: list[FinancialEvent]) -> tuple[FinancialEvent, ...]:
+    unique: dict[tuple, FinancialEvent] = {}
+    for event in events:
+        key = (event.user_id, event.event_type, event.category, event.direction, event.amount, event.currency,
+               event.event_date, event.settlement_date, event.status, event.linked_event_id)
+        unique.setdefault(key, event)
+    rows = list(unique.values())
+    by_id = {event.event_id: event for event in rows}
+    discarded: set[str] = set()
+    for event in rows:
+        prior = by_id.get(event.linked_event_id or "")
+        if not prior or prior.direction != event.direction or prior.currency != event.currency:
+            continue
+        if prior.amount != event.amount and event.status != EventStatus.SETTLED:
+            continue
+        prior_rank = (_STATUS_RANK.get(prior.status, 0), prior.settlement_date or prior.event_date)
+        event_rank = (_STATUS_RANK.get(event.status, 0), event.settlement_date or event.event_date)
+        discarded.add(prior.event_id if event_rank >= prior_rank else event.event_id)
+    return tuple(event for event in rows if event.event_id not in discarded)
+
+
+def reconcile_events(events, facts) -> tuple[FinancialEvent, ...]:
+    facts = tuple(facts)
     by_event: dict[str, list[tuple[int, EvidenceFact]]] = {}
     for position, fact in enumerate(facts):
         if fact.related_event_id:
             by_event.setdefault(fact.related_event_id, []).append((position, fact))
-
-    resolved: list[FinancialEvent] = []
-    for event in events:
-        related = by_event.get(event.event_id, [])
-        if not related:
-            resolved.append(event)
-            continue
-        cancellation = [item for item in related if item[1].effect in _CANCELLATION_EFFECTS or item[1].status == EventStatus.CANCELLED]
-        if cancellation:
-            resolved.append(replace(event, status=EventStatus.CANCELLED))
-            continue
-
-        chosen = max(related, key=lambda item: _fact_rank(item[1], item[0]))[1]
-        amount_facts = [item for item in related if item[1].amount is not None and item[1].effect in _AMENDMENT_EFFECTS]
-        date_facts = [item for item in related if item[1].effective_date is not None and item[1].effect in _AMENDMENT_EFFECTS]
-        status_facts = [item for item in related if item[1].status is not None and item[1].effect in _AMENDMENT_EFFECTS]
-        amount_fact = max(amount_facts, key=lambda item: _fact_rank(item[1], item[0]))[1] if amount_facts else None
-        date_fact = max(date_facts, key=lambda item: _fact_rank(item[1], item[0]))[1] if date_facts else None
-        status_fact = max(status_facts, key=lambda item: _fact_rank(item[1], item[0]))[1] if status_facts else None
-
-        updated = event
-        if amount_fact is not None:
-            updated = replace(updated, amount=amount_fact.amount, currency=amount_fact.currency or updated.currency)
-        if date_fact is not None:
-            updated = replace(updated, event_date=date_fact.effective_date)
-            if status_fact and status_fact.status in {EventStatus.SETTLED, EventStatus.PENDING, EventStatus.SCHEDULED}:
-                updated = replace(updated, settlement_date=date_fact.effective_date)
-        if status_fact is not None:
-            updated = replace(updated, status=status_fact.status)
-            if status_fact.status == EventStatus.SETTLED and date_fact is not None:
-                updated = replace(updated, settlement_date=date_fact.effective_date)
-        resolved.append(updated)
-    return tuple(resolved)
+    resolved = [_apply_event_facts(event, by_event.get(event.event_id, [])) for event in events]
+    user_id = resolved[0].user_id if resolved else ""
+    for position, fact in enumerate(facts):
+        if fact.related_event_id is None:
+            stream = _stream_event(fact, user_id, position)
+            if stream:
+                resolved.append(stream)
+    return _deduplicate_lifecycles(resolved)
 
 
 def reconcile_context(context):
