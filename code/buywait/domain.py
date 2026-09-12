@@ -132,6 +132,10 @@ class EvidenceFact:
     recurrence_days: int | None = None
     flexibility: str = "fixed"
     minimum_allowed_amount: Decimal | None = None
+    # Semantic source supplied by the extractor/critic. Python, never the
+    # model, turns this into the canonical stream key.
+    stream_source: str | None = None
+    # Legacy cache compatibility only; new model schemas do not expose it.
     stream_key: str | None = None
 
 

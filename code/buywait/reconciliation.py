@@ -69,7 +69,7 @@ def _stream_event(fact: EvidenceFact, user_id: str, position: int) -> FinancialE
     return FinancialEvent(
         event_id=f"evidence:{fact.evidence_id}:{position}", user_id=user_id,
         event_type="income" if fact.direction == "credit" else "expense",
-        description=fact.description or fact.stream_key or ("Terminal stream evidence" if terminal else "Evidence stream update"),
+        description=fact.stream_source or fact.description or ("Terminal stream evidence" if terminal else "Evidence stream update"),
         category=fact.category, direction=fact.direction, amount=fact.amount,
         currency=fact.currency or "", event_date=fact.effective_date,
         settlement_date=fact.effective_date if fact.status == EventStatus.SETTLED else None,
@@ -127,6 +127,39 @@ def _mark_internal_transfer_pair(events: list[FinancialEvent], event_id: str) ->
     return [replace(event, event_type="internal_transfer") if event.event_id in component else event for event in events]
 
 
+def _event_day(event: FinancialEvent):
+    return event.settlement_date or event.event_date
+
+
+def _unique_transfer_pair(events: list[FinancialEvent], fact: EvidenceFact) -> tuple[str, str] | None:
+    """Find one strong debit/credit match for request-level transfer evidence."""
+    candidates: list[tuple[tuple[int, int], str, str]] = []
+    debits = [event for event in events if event.direction == "debit" and event.amount is not None]
+    credits = [event for event in events if event.direction == "credit" and event.amount is not None]
+    for debit in debits:
+        for credit in credits:
+            if debit.amount != credit.amount or debit.currency != credit.currency:
+                continue
+            if fact.amount is not None and debit.amount != fact.amount:
+                continue
+            if fact.currency is not None and debit.currency != fact.currency:
+                continue
+            distance = abs((_event_day(debit) - _event_day(credit)).days)
+            if distance > 3:
+                continue
+            if fact.effective_date and min(abs((_event_day(debit) - fact.effective_date).days), abs((_event_day(credit) - fact.effective_date).days)) > 3:
+                continue
+            linked = credit.linked_event_id == debit.event_id or debit.linked_event_id == credit.event_id
+            # A linked lifecycle is strongest; otherwise same amount/currency
+            # and an exact/near date can qualify only when unique.
+            candidates.append(((1 if linked else 0, -distance), debit.event_id, credit.event_id))
+    if not candidates:
+        return None
+    best_score = max(candidate[0] for candidate in candidates)
+    best = [(debit, credit) for score, debit, credit in candidates if score == best_score]
+    return best[0] if len(best) == 1 else None
+
+
 def reconcile_events(events, facts) -> tuple[FinancialEvent, ...]:
     facts = tuple(facts)
     by_event: dict[str, list[tuple[int, EvidenceFact]]] = {}
@@ -135,8 +168,17 @@ def reconcile_events(events, facts) -> tuple[FinancialEvent, ...]:
             by_event.setdefault(fact.related_event_id, []).append((position, fact))
     resolved = [_apply_event_facts(event, by_event.get(event.event_id, [])) for event in events]
     for fact in facts:
-        if fact.effect == "internal_transfer" and fact.related_event_id:
+        if fact.effect != "internal_transfer":
+            continue
+        if fact.related_event_id:
             resolved = _mark_internal_transfer_pair(resolved, fact.related_event_id)
+        else:
+            pair = _unique_transfer_pair(resolved, fact)
+            if pair:
+                # Both IDs are in the same inferred two-event lifecycle for
+                # this fact. Marking the explicit pair avoids any category-
+                # wide or one-sided suppression.
+                resolved = [replace(event, event_type="internal_transfer") if event.event_id in pair else event for event in resolved]
     # Employment, rent, and similar stream evidence often has no one-to-one
     # event row. A terminal stream fact must stop inferred recurrence as well
     # as supplied future occurrences; the supplied opening balance already
@@ -144,10 +186,11 @@ def reconcile_events(events, facts) -> tuple[FinancialEvent, ...]:
     for fact in facts:
         if fact.related_event_id is not None or fact.effect not in _CANCELLATION_EFFECTS:
             continue
-        if not fact.category or not fact.direction or not fact.stream_key:
+        fact_key = _fact_stream_key(fact)
+        if not fact.category or not fact.direction or not fact_key:
             continue
         resolved = [replace(event, status=EventStatus.CANCELLED)
-                    if event_stream_key(event) == fact.stream_key
+                    if event_stream_key(event) == fact_key
                     else event for event in resolved]
     user_id = resolved[0].user_id if resolved else ""
     for position, fact in enumerate(facts):
@@ -160,3 +203,14 @@ def reconcile_events(events, facts) -> tuple[FinancialEvent, ...]:
 
 def reconcile_context(context):
     return replace(context, events=reconcile_events(context.events, context.evidence_facts))
+
+
+def _fact_stream_key(fact: EvidenceFact) -> str | None:
+    if fact.stream_source and fact.category and fact.direction:
+        return stream_key(fact.category, fact.direction, fact.stream_source)
+    # Read legacy cached facts written before stream_source existed.
+    if fact.stream_key:
+        return fact.stream_key
+    if fact.description and fact.category and fact.direction:
+        return stream_key(fact.category, fact.direction, fact.description)
+    return None

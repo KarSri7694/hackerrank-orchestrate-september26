@@ -157,6 +157,23 @@ class AgentCriticTests(unittest.TestCase):
         inferred = EvidenceFact("message_1", "terminate", amount=Decimal("500"), category="salary", direction="credit")
         self.assertFalse(app._fact_is_supported(raw, inferred))
 
+    def test_semantic_text_support_allows_constrained_multilingual_stream_correction(self):
+        reference = EvidenceReference("message_zh", "employer", "u", text="Cobalt Systems 的雇佣关系已结束")
+        app = Application.__new__(Application)
+        app.evidence_service = type("Evidence", (), {"inspect": lambda _self, _id: ()})()
+        raw = type("Raw", (), {"evidence_refs": (reference,)})()
+        correction = EvidenceFact("message_zh", "terminate", category="salary", direction="credit", stream_source="Cobalt Systems")
+        self.assertTrue(app._fact_is_supported(raw, correction))
+
+    def test_image_amount_correction_requires_exact_structured_vlm_fact(self):
+        reference = EvidenceReference("image_1", "image", "u", related_event_id="event_1")
+        supported = EvidenceFact("image_1", "image_amount", "event_1", Decimal("500"), "USD")
+        app = Application.__new__(Application)
+        app.evidence_service = type("Evidence", (), {"inspect": lambda _self, _id: (supported,)})()
+        raw = type("Raw", (), {"evidence_refs": (reference,)})()
+        self.assertTrue(app._fact_is_supported(raw, supported))
+        self.assertFalse(app._fact_is_supported(raw, EvidenceFact("image_1", "image_amount", "event_1", Decimal("501"), "USD")))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,7 +10,7 @@ from .adapters.exchange_rates import CsvExchangeRates
 from .core import _optimized_changes, baseline, simulate, solve, validate_changes
 from .domain import CorrectionEvaluation, EvidenceFact, EventStatus, Payment, SpendingChange
 from .evidence import EvidenceService
-from .reconciliation import reconcile_context
+from .reconciliation import _fact_stream_key, reconcile_context
 
 
 class Application:
@@ -55,7 +55,7 @@ class Application:
         event_ids = {event.event_id for event in raw.events}
         allowed_effects = {"cancel", "cancelled", "cancellation", "terminate", "terminated",
                            "amend", "amendment", "amount_amendment", "date_amendment",
-                           "delay", "delayed", "settle", "settled", "stream_update",
+                           "delay", "delayed", "settle", "settled", "image_amount", "stream_update",
                            "internal_transfer", "one_time"}
         for fact in facts:
             if fact.evidence_id not in support or fact.evidence_id not in reference_ids:
@@ -68,7 +68,7 @@ class Application:
                 return CorrectionEvaluation(False, "correction references an unknown event", baseline_decision)
             if not fact.related_event_id and not (fact.category and fact.direction and fact.effective_date):
                 return CorrectionEvaluation(False, "stream correction lacks category, direction, or effective date", baseline_decision)
-            if fact.effect in {"terminate", "terminated"} and not fact.related_event_id and not fact.stream_key:
+            if fact.effect in {"terminate", "terminated"} and not fact.related_event_id and not _fact_stream_key(fact):
                 return CorrectionEvaluation(False, "stream termination lacks a stable stream identity", baseline_decision)
             if fact.direction and fact.direction not in {"credit", "debit"}:
                 return CorrectionEvaluation(False, "invalid stream direction", baseline_decision)
@@ -99,10 +99,12 @@ class Application:
         reference = next(ref for ref in raw.evidence_refs if ref.evidence_id == fact.evidence_id)
         extracted = self.evidence_service.inspect(fact.evidence_id)
         fields = ("effect", "related_event_id", "amount", "currency", "effective_date", "status",
-                  "category", "direction", "recurring", "recurrence_days", "stream_key")
+                  "category", "direction", "recurring", "recurrence_days")
         for known in extracted:
-            if all(getattr(known, field) == getattr(fact, field)
-                   for field in fields if getattr(fact, field) is not None):
+            exact = all(getattr(known, field) == getattr(fact, field)
+                        for field in fields if getattr(fact, field) is not None)
+            same_stream = not fact.stream_source or _fact_stream_key(known) == _fact_stream_key(fact)
+            if exact and same_stream:
                 # effect is mandatory, so this branch never treats an omitted
                 # extractor field as proof for an arbitrary critic value.
                 return True
@@ -110,41 +112,22 @@ class Application:
         # be supported by the VLM's structured extraction above.
         if reference.source_type == "image":
             return False
-        text = (reference.text or "").lower()
+        text = (reference.text or "").casefold()
         if not text:
             return False
-        keywords = {
-            "cancel": ("cancel", "void", "reversed"),
-            "cancelled": ("cancel", "void", "reversed"),
-            "cancellation": ("cancel", "void", "reversed"),
-            "terminate": ("terminat", "ended", "laid off", "resign", "last day"),
-            "terminated": ("terminat", "ended", "laid off", "resign", "last day"),
-            "internal_transfer": ("internal transfer", "transfer between", "own account"),
-            "one_time": ("one-time", "one time", "not recurring"),
-            "amend": ("amend", "changed", "updated", "corrected"),
-            "amendment": ("amend", "changed", "updated", "corrected"),
-            "amount_amendment": ("amend", "changed", "updated", "corrected"),
-            "date_amendment": ("amend", "changed", "updated", "corrected"),
-            "delay": ("delay", "postpon", "reschedul"),
-            "delayed": ("delay", "postpon", "reschedul"),
-            "settle": ("settled", "paid", "completed"),
-            "settled": ("settled", "paid", "completed"),
-            "stream_update": ("salary", "rent", "employment", "payroll", "recurring"),
-        }
-        if not any(word in text for word in keywords.get(fact.effect, ())):
-            return False
+        # The constrained critic is the semantic interpreter for effect,
+        # category, direction, status, and recurrence.  Raw text is only used
+        # for deterministic checks of literal source identifiers and numeric
+        # claims; this works for multilingual text without English keywords.
         scalar_fields = {
-            "related_event_id": fact.related_event_id, "amount": str(fact.amount) if fact.amount is not None else None,
+            "related_event_id": None if fact.related_event_id == reference.related_event_id else fact.related_event_id,
+            "amount": str(fact.amount) if fact.amount is not None else None,
             "currency": fact.currency, "effective_date": fact.effective_date.isoformat() if fact.effective_date else None,
-            "status": fact.status.value if fact.status else None, "category": fact.category,
-            "direction": fact.direction, "recurrence_days": str(fact.recurrence_days) if fact.recurrence_days is not None else None,
-            "stream_key": fact.stream_key,
+            "stream_source": fact.stream_source,
         }
-        if any(str(value).lower() not in text for value in scalar_fields.values() if value is not None):
+        if any(str(value).casefold() not in text for value in scalar_fields.values() if value is not None):
             return False
-        if fact.recurring is True and not any(word in text for word in ("recurring", "monthly", "weekly", "every ")):
-            return False
-        if fact.recurring is False and not any(word in text for word in ("one-time", "one time", "not recurring")):
+        if not any(value is not None for value in scalar_fields.values()) and not reference.related_event_id:
             return False
         return True
 
