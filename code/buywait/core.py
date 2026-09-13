@@ -22,7 +22,7 @@ def _cash(event: FinancialEvent, home_currency: str, fx, on_date: date) -> Decim
     return value if event.direction == "credit" else -value
 
 
-def _effective_events(ctx: RequestContext, fx) -> list[tuple[date, Decimal, str, FinancialEvent]]:
+def _effective_events(ctx: RequestContext, fx, duplicate_suppressions: list[dict[str, str]] | None = None) -> list[tuple[date, Decimal, str, FinancialEvent]]:
     request_date = ctx.request.request_date
     end = request_date + timedelta(days=89)
     rows: list[tuple[date, Decimal, str, FinancialEvent]] = []
@@ -74,7 +74,7 @@ def _effective_events(ctx: RequestContext, fx) -> list[tuple[date, Decimal, str,
             event_day = request_date
         if event_day >= request_date and event_day <= end:
             rows.append((event_day, _cash(event, ctx.profile.home_currency, fx, event_day), event.event_id, event))
-    for stream in detect_recurrences(ctx.events):
+    for stream in detect_recurrences(ctx.events, request_date):
         last = stream.representative
         next_day = stream.starts_on or last.settlement_date or last.event_date
         while next_day < request_date:
@@ -87,11 +87,26 @@ def _effective_events(ctx: RequestContext, fx) -> list[tuple[date, Decimal, str,
             # (for example two employers). Only an explicit event from this
             # stream suppresses its inferred occurrence.
             same_stream_exists = any(x[0] == next_day
-                                     and (is_same_stream(x[3], last)
+                                     and ((stream.kind == "variable_category"
+                                           and x[3].category == last.category
+                                           and x[3].direction == last.direction
+                                           and x[3].currency == last.currency)
+                                          or is_same_stream(x[3], last)
                                           or last.event_type == "aggregate_stream_update")
                                      for x in rows)
             if not same_stream_exists:
                 rows.append((next_day, _cash(last, ctx.profile.home_currency, fx, next_day), last.event_id, last))
+            elif duplicate_suppressions is not None:
+                explicit = next(x[3] for x in rows if x[0] == next_day
+                                and ((stream.kind == "variable_category"
+                                      and x[3].category == last.category
+                                      and x[3].direction == last.direction
+                                      and x[3].currency == last.currency)
+                                     or is_same_stream(x[3], last)
+                                     or last.event_type == "aggregate_stream_update"))
+                duplicate_suppressions.append({"inferred_event_id": last.event_id,
+                                               "explicit_event_id": explicit.event_id,
+                                               "date": next_day.isoformat()})
             next_day = stream.next_date(next_day)
     return rows
 
@@ -186,6 +201,75 @@ def baseline(ctx: RequestContext, fx) -> tuple[Decimal, date | None]:
             earliest = day
             break
     return safe_today, earliest
+
+
+def explain_timeline(ctx: RequestContext, fx) -> dict[str, object]:
+    """Return an auditable deterministic forecast without changing decisions.
+
+    This is intentionally data-only so the regression harness and MCP/debug
+    clients can expose the assumptions behind a safe amount.  It includes
+    excluded source events and the post-event balance at every projected row.
+    """
+    ctx = reconcile_context(ctx)
+    request_date = ctx.request.request_date
+    end = request_date + timedelta(days=89)
+    streams = detect_recurrences(ctx.events, request_date)
+    suppressions: list[dict[str, str]] = []
+    rows = _effective_events(ctx, fx, suppressions)
+    explicit_ids = {
+        event.event_id for event in ctx.events
+        if event.amount is not None and event.status not in {EventStatus.FAILED, EventStatus.CANCELLED, EventStatus.UNREALIZED}
+        and (event.settlement_date or event.event_date) >= request_date
+    }
+    balance = ctx.profile.current_available_balance
+    minimum_balance = balance
+    minimum_date = request_date
+    projected = []
+    for day, amount, event_id, event in sorted(rows, key=lambda item: (item[0], item[1], item[2])):
+        if not request_date <= day <= end:
+            continue
+        balance += amount
+        if balance < minimum_balance:
+            minimum_balance = balance
+            minimum_date = day
+        inferred = event_id not in explicit_ids
+        projected.append({
+            "date": day.isoformat(), "event_id": event_id,
+            "amount": str(amount), "category": event.category,
+            "direction": event.direction, "currency": event.currency,
+            "origin": "inferred_recurring" if inferred else "explicit",
+            "balance_after": str(balance),
+        })
+    safe, earliest = baseline(ctx, fx)
+    ignored = []
+    for event in ctx.events:
+        if event.amount is None:
+            reason = "missing_amount"
+        elif event.event_type == "internal_transfer":
+            reason = "internal_transfer"
+        elif event.status in {EventStatus.FAILED, EventStatus.CANCELLED, EventStatus.UNREALIZED}:
+            reason = f"status_{event.status.value}"
+        elif event.status == EventStatus.PENDING and event.direction == "credit":
+            reason = "pending_credit"
+        else:
+            continue
+        ignored.append({"event_id": event.event_id, "reason": reason})
+    return {
+        "opening_balance": str(ctx.profile.current_available_balance),
+        "minimum_balance_to_keep": str(ctx.profile.minimum_balance_to_keep),
+        "streams": [{"event_id": stream.representative.event_id, "kind": stream.kind,
+                     "category": stream.representative.category, "direction": stream.representative.direction,
+                     "currency": stream.representative.currency, "amount": str(stream.representative.amount),
+                     "cadence_days": stream.cadence_days,
+                     "covered_event_ids": sorted(stream.covered_event_ids)} for stream in streams],
+        "ignored_events": ignored,
+        "duplicate_suppressed_events": suppressions,
+        "projected_events": projected,
+        "minimum_projected_balance": str(minimum_balance),
+        "minimum_projected_balance_date": minimum_date.isoformat(),
+        "amount_safe_to_pay": str(safe),
+        "earliest_date_for_full_payment": earliest.isoformat() if earliest else None,
+    }
 
 
 def expand_option(option) -> tuple[Payment, ...]:

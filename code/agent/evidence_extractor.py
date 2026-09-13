@@ -144,6 +144,10 @@ def _json_payload(raw: str):
 class OpenAIEvidenceExtractor:
     """LLM/VLM adapter: extraction only; no financial decisions or arithmetic."""
 
+    # Cache identity must change whenever the extraction instructions/schema
+    # or the contextual ledger representation changes.
+    EXTRACTOR_PROMPT_VERSION = "facts-context-v1"
+
     # An empty response may mean the thinking model exhausted its output
     # before emitting JSON. Do not persist that transient failure as a valid
     # negative extraction across fresh production runs.
@@ -152,9 +156,14 @@ class OpenAIEvidenceExtractor:
     def __init__(self, config, usage_tracker=None, trace_writer=None):
         self.client = OpenAIResponsesClient(config, usage_tracker=usage_tracker, trace_writer=trace_writer)
         self.model = config.model
+        self.cache_version = self.EXTRACTOR_PROMPT_VERSION
         self.image_detail = config.image_detail
         self.vision_enabled = config.vision_enabled
         self.evidence_timeout = config.evidence_timeout
+        # Auto mode may use a compatible provider that is temporarily
+        # unavailable; the deterministic engine must still be able to finish
+        # a request. Explicit enabled mode remains fail-closed for diagnosis.
+        self.fail_open = config.ai_mode != "enabled"
         self._trace_request_id = None
 
     def set_trace_request(self, request_id: str | None):

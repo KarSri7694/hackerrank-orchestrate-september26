@@ -158,9 +158,13 @@ def _field_category(field: str, expected: str, actual: str) -> str:
     return "PLAN_RANKING"
 
 
-def evaluate_samples(dataset_dir: str | Path, evidence_extractor=None, progress=None, decision_provider=None) -> tuple[SampleResult, ...]:
+def evaluate_samples(dataset_dir: str | Path, evidence_extractor=None, progress=None, decision_provider=None,
+                     evidence_cache_path: str | Path | None = None,
+                     allow_legacy_evidence_cache: bool = True) -> tuple[SampleResult, ...]:
     dataset_dir = Path(dataset_dir)
-    app = Application(dataset_dir, evidence_extractor=evidence_extractor)
+    app = Application(dataset_dir, evidence_extractor=evidence_extractor,
+                      evidence_cache_path=evidence_cache_path,
+                      allow_legacy_evidence_cache=allow_legacy_evidence_cache)
     with (dataset_dir / "sample_requests.csv").open(newline="", encoding="utf-8-sig") as handle:
         rows = list(csv.DictReader(handle))
     # The public samples have their own request IDs and are intentionally not

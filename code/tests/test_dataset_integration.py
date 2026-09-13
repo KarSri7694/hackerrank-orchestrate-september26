@@ -42,6 +42,34 @@ class DatasetIntegrationTests(unittest.TestCase):
         self.assertNotEqual(stream_key("salary", "credit", "Cobalt payroll"),
                             stream_key("salary", "credit", "Riverline payroll"))
 
+    def test_description_normalized_salary_keeps_employers_separate(self):
+        rows = []
+        descriptions = ("Acme payroll", "Acme monthly salary", "salary from Acme")
+        for index, (month, description) in enumerate(zip((1, 2, 3), descriptions), 1):
+            rows.append(FinancialEvent(f"acme-{index}", "u", "income", description, "salary", "credit",
+                                       Decimal("100"), "USD", date(2024, month, 15), date(2024, month, 15),
+                                       EventStatus.SETTLED, None, "fixed", None))
+            rows.append(FinancialEvent(f"beta-{index}", "u", "income", "Beta payroll", "salary", "credit",
+                                       Decimal("200"), "USD", date(2024, month, 20), date(2024, month, 20),
+                                       EventStatus.SETTLED, None, "fixed", None))
+        salaries = [stream for stream in detect_recurrences(tuple(rows)) if stream.representative.category == "salary"]
+        self.assertEqual({stream.representative.amount for stream in salaries}, {Decimal("100"), Decimal("200")})
+
+    def test_description_normalized_subscription_and_opt_in_variable_aggregate(self):
+        subscriptions = [FinancialEvent(f"netflix-{month}", "u", "expense", description, "streaming", "debit",
+                                        Decimal("15"), "USD", date(2024, month, 10), date(2024, month, 10),
+                                        EventStatus.SETTLED, None, "fixed", None)
+                         for month, description in zip((1, 2, 3), ("Netflix subscription", "Netflix recurring payment", "Netflix monthly charge"))]
+        groceries = [FinancialEvent(f"grocery-{month}", "u", "expense", description, "groceries", "debit",
+                                    Decimal(amount), "USD", date(2024, month, 20), date(2024, month, 20),
+                                    EventStatus.SETTLED, None, "fixed", None)
+                     for month, (description, amount) in enumerate((("FreshMart", "180"), ("Local Grocery", "220"), ("Supermarket", "200")), 1)]
+        streams = detect_recurrences(tuple(subscriptions + groceries), date(2024, 4, 1), include_variable_aggregates=True)
+        self.assertEqual(len([stream for stream in streams if stream.representative.category == "streaming"]), 1)
+        aggregate = next(stream for stream in streams if stream.kind == "variable_category")
+        self.assertEqual(aggregate.representative.amount, Decimal("220"))
+        self.assertTrue(aggregate.covered_event_ids.isdisjoint({stream.representative.event_id for stream in streams if stream.kind == "named"}))
+
     def test_category_only_activity_does_not_become_a_recurring_stream(self):
         exact = [FinancialEvent(
             f"subscription-{month}", "u", "expense", "Dining subscription", "dining", "debit", Decimal("20"), "USD",

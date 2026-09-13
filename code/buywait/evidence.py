@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
+import re
+from datetime import date
+from decimal import Decimal, InvalidOperation
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,13 +20,44 @@ class NullEvidenceExtractor:
         return ()
 
 
+def _explicit_payroll_fallback(reference) -> tuple[EvidenceFact, ...]:
+    """Fail-open only for an unambiguous, dated payroll amount.
+
+    This is not a general NLP substitute.  It deliberately requires an
+    employer source, payroll vocabulary, an ISO date, and a stated ISO-code
+    currency amount.  Anything less remains untrusted/no-op when a provider
+    is unavailable.
+    """
+    if reference.source_type != "employer" or not reference.text:
+        return ()
+    text = reference.text
+    lowered = text.casefold()
+    if not any(token in lowered for token in ("salary", "payroll", "gaji", "penggajian")):
+        return ()
+    date_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
+    amount_match = re.search(r"\b(USD|EUR|GBP|INR|IDR|ZAR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)\b", text, re.IGNORECASE)
+    if not date_match or not amount_match:
+        return ()
+    try:
+        effective_date = date.fromisoformat(date_match.group(1))
+        amount = Decimal(amount_match.group(2).replace(",", ""))
+    except (ValueError, InvalidOperation):
+        return ()
+    if amount <= 0:
+        return ()
+    return (EvidenceFact(reference.evidence_id, "stream_update", amount=amount,
+                         currency=amount_match.group(1).upper(), effective_date=effective_date,
+                         category="salary", direction="credit", recurring=True,
+                         recurrence_days=30),)
+
+
 class EvidenceService:
     # Bump when extraction instructions/normalization change so malformed or
     # incomplete facts from an older local-model run are not reused.
     CACHE_SCHEMA_VERSION = "evidence-facts-v22"
 
     def __init__(self, repository, extractor=None, persistent_cache: JsonEvidenceCache | None = None,
-                 stream_context_provider=None):
+                 stream_context_provider=None, allow_legacy_cache: bool = True):
         self.repository = repository
         self.extractor = extractor or NullEvidenceExtractor()
         self._facts: dict[str, tuple[EvidenceFact, ...]] = {}
@@ -33,6 +68,7 @@ class EvidenceService:
         # stale external interpretation and usage accounting would be false.
         self._cache_enabled = not isinstance(self.extractor, NullEvidenceExtractor)
         self.stream_context_provider = stream_context_provider
+        self.allow_legacy_cache = allow_legacy_cache
         self.cache_hits = 0
         self.extraction_calls = 0
 
@@ -41,7 +77,16 @@ class EvidenceService:
         if reference.image_path and Path(reference.image_path).is_file():
             content += Path(reference.image_path).read_bytes()
         model = getattr(self.extractor, "model", self.extractor.__class__.__name__)
-        return f"{reference.evidence_id}:{model}:{self.CACHE_SCHEMA_VERSION}:{hashlib.sha256(content).hexdigest()}"
+        prompt_version = getattr(self.extractor, "cache_version", "default")
+        # Keep the historical shape for context-free third-party extractors.
+        # Production Application always supplies a ledger context and therefore
+        # uses the stronger identity below.
+        if self.stream_context_provider is None and prompt_version == "default":
+            return f"{reference.evidence_id}:{model}:{self.CACHE_SCHEMA_VERSION}:{hashlib.sha256(content).hexdigest()}"
+        context = self.stream_context_provider(reference) if self.stream_context_provider else ()
+        context_bytes = json.dumps(context, default=str, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        digest = hashlib.sha256(content + b"\0" + context_bytes).hexdigest()
+        return f"{reference.evidence_id}:{model}:{prompt_version}:{self.CACHE_SCHEMA_VERSION}:{digest}"
 
     def _cache_empty_results(self) -> bool:
         return bool(getattr(self.extractor, "cache_empty_results", True))
@@ -54,7 +99,7 @@ class EvidenceService:
         expensive VLM extraction. The application validation boundary still
         decides whether the legacy fact is admissible.
         """
-        if not self.persistent_cache:
+        if not self.persistent_cache or not self.allow_legacy_cache:
             return None
         prefix, content_hash = key.rsplit(":", 1)
         current_schema = self.CACHE_SCHEMA_VERSION
@@ -138,10 +183,18 @@ class EvidenceService:
         if cached is None:
             context = self.stream_context_provider(ref) if self.stream_context_provider else ()
             parameters = inspect.signature(self.extractor.extract).parameters
-            if "stream_context" in parameters:
-                produced = self.extractor.extract(ref, stream_context=context)
-            else:
-                produced = self.extractor.extract(ref)
+            try:
+                if "stream_context" in parameters:
+                    produced = self.extractor.extract(ref, stream_context=context)
+                else:
+                    produced = self.extractor.extract(ref)
+            except Exception:
+                if not getattr(self.extractor, "fail_open", False):
+                    raise
+                # In auto mode an unavailable model is not evidence. Keep the
+                # deterministic raw/reconciled state usable and avoid caching
+                # the transient failure as an empty extraction.
+                produced = _explicit_payroll_fallback(ref)
             self.extraction_calls += 1
             cached = self._normalized(produced, ref)
             if self.persistent_cache and (cached or self._cache_empty_results()):

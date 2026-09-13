@@ -8,6 +8,7 @@ from dotenv import dotenv_values
 
 
 REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+AGENT_APIS = frozenset({"auto", "responses", "chat"})
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,7 @@ class AgentConfig:
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-5"
     reasoning_effort: str | None = "medium"
+    agent_api: str = "auto"
     ai_mode: str = "auto"
     timeout: float = 60.0
     evidence_timeout: float = 180.0
@@ -42,11 +44,15 @@ class AgentConfig:
                 raise ValueError(
                     f"OPENAI_REASONING_EFFORT must be one of {sorted(REASONING_EFFORTS)}"
                 )
+        agent_api = (value("OPENAI_AGENT_API", "auto") or "auto").lower()
+        if agent_api not in AGENT_APIS:
+            raise ValueError(f"OPENAI_AGENT_API must be one of {sorted(AGENT_APIS)}")
         return cls(
             api_key=value("OPENAI_API_KEY"),
             base_url=value("OPENAI_BASE_URL", "https://api.openai.com/v1"),
             model=value("OPENAI_MODEL", "gpt-5"),
             reasoning_effort=reasoning_effort,
+            agent_api=agent_api,
             ai_mode=(value("AI_MODE", "auto") or "auto").lower(),
             timeout=float(value("OPENAI_TIMEOUT", "60")),
             evidence_timeout=float(value("OPENAI_EVIDENCE_TIMEOUT", "180")),

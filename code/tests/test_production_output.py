@@ -26,6 +26,14 @@ from evaluation.output_validation import OutputValidationError, _validate_explan
 
 
 class ProductionOutputTests(unittest.TestCase):
+    def test_fail_open_payroll_fallback_requires_explicit_amount_and_date(self):
+        from buywait.evidence import _explicit_payroll_fallback
+        explicit = EvidenceReference("pay", "employer", "u", text="Payroll update: salary is EUR 1661 from 2026-01-15.")
+        fact = _explicit_payroll_fallback(explicit)[0]
+        self.assertEqual((fact.amount, fact.currency, fact.effective_date, fact.category, fact.direction),
+                         (Decimal("1661"), "EUR", date(2026, 1, 15), "salary", "credit"))
+        self.assertEqual(_explicit_payroll_fallback(EvidenceReference("vague", "employer", "u", text="Payroll is changing soon.")), ())
+
 
     def test_ingestion_rejects_unknown_or_cross_user_lifecycle_links(self):
         event = FinancialEvent("e1", "u1", "expense", "bill", "rent", "debit", Decimal("1"), "USD", date(2026, 1, 1), date(2026, 1, 1), EventStatus.SETTLED, None, "fixed", None)
@@ -462,6 +470,36 @@ class ProductionOutputTests(unittest.TestCase):
         extractor.evidence_timeout = 123
         extractor.extract(EvidenceReference("message", "bank", "u", text="no financial fact"))
         self.assertEqual(extractor.client.kwargs["timeout"], 123)
+
+    def test_auto_evidence_provider_failure_falls_back_to_empty_facts(self):
+        reference = EvidenceReference("auto_failure", "employer", "u", text="Salary update")
+        class Repository:
+            def evidence(self, _evidence_id):
+                return reference
+        class Extractor:
+            model = "auto-failure"
+            fail_open = True
+            def extract(self, _reference):
+                raise RuntimeError("provider unavailable")
+        from buywait.evidence import EvidenceService
+        service = EvidenceService(Repository(), Extractor())
+        self.assertEqual(service.inspect("auto_failure"), ())
+        self.assertEqual(service.extraction_calls, 1)
+
+    def test_enabled_evidence_provider_failure_remains_fail_closed(self):
+        reference = EvidenceReference("enabled_failure", "employer", "u", text="Salary update")
+        class Repository:
+            def evidence(self, _evidence_id):
+                return reference
+        class Extractor:
+            model = "enabled-failure"
+            fail_open = False
+            def extract(self, _reference):
+                raise RuntimeError("provider unavailable")
+        from buywait.evidence import EvidenceService
+        service = EvidenceService(Repository(), Extractor())
+        with self.assertRaisesRegex(RuntimeError, "provider unavailable"):
+            service.inspect("enabled_failure")
 
     def test_parse_json_object_extracts_final_object_after_thinking(self):
         self.assertEqual(parse_json_object('scratch {not-json}\n```json\n{"agree":true}\n```'), {"agree": True})

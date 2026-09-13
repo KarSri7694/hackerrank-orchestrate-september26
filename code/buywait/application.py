@@ -9,7 +9,7 @@ import re
 from .adapters.csv_repository import CsvRepository
 from .adapters.evidence_cache import JsonEvidenceCache
 from .adapters.exchange_rates import CsvExchangeRates
-from .core import _optimized_changes, baseline, expand_option, simulate, solve, validate_changes
+from .core import _optimized_changes, baseline, expand_option, explain_timeline, simulate, solve, validate_changes
 from .domain import CorrectionEvaluation, EvidenceFact, EventStatus, Payment, SpendingChange
 from .evidence import EvidenceService
 from .presentation import decision_explanation
@@ -20,13 +20,15 @@ from .recurrence import detect_recurrences, event_stream_key
 class Application:
     """Inbound application services used by CLI and MCP adapters."""
 
-    def __init__(self, dataset_dir: str | Path, evidence_extractor=None, evidence_cache_path: str | Path | None = None):
+    def __init__(self, dataset_dir: str | Path, evidence_extractor=None, evidence_cache_path: str | Path | None = None,
+                 allow_legacy_evidence_cache: bool = True):
         self.repository = CsvRepository(dataset_dir)
         self.fx = CsvExchangeRates(Path(dataset_dir) / "exchange_rates.csv")
         cache_path = Path(evidence_cache_path) if evidence_cache_path else Path(dataset_dir) / ".evidence_cache.json"
         self.evidence_service = EvidenceService(
             self.repository, evidence_extractor, JsonEvidenceCache(cache_path),
             stream_context_provider=self._stream_context_for_evidence,
+            allow_legacy_cache=allow_legacy_evidence_cache,
         )
 
     def _stream_context_for_evidence(self, reference):
@@ -253,6 +255,10 @@ class Application:
 
     def decision(self, request_id: str):
         return solve(self._context(request_id), self.fx)
+
+    def explain_timeline(self, request_id: str) -> dict[str, object]:
+        """Expose the same reconciled deterministic timeline used by solve."""
+        return explain_timeline(self._context(request_id), self.fx)
 
     def finalized_decision(self, request_id: str, decision=None):
         """Attach the submission explanation from the same reconciled state used to solve."""

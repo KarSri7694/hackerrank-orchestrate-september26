@@ -59,6 +59,25 @@ class CalculatorOpenAI(FakeOpenAI):
         return Response([], json.dumps(payload))
 
 
+class SimulatePlanOpenAI(FakeOpenAI):
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            return Response([
+                Item("function_call", name="inspect_evidence", call_id="evidence_1",
+                     arguments=json.dumps({"evidence_id": "message_04"})),
+                Item("function_call", name="simulate_plan", call_id="plan_1", arguments=json.dumps({
+                    "request_id": "request_26",
+                    "payments": [{"date": "2025-08-03", "amount": "1"}],
+                    # Exact malformed-but-common model shape from the Qwen trace.
+                    "spending_changes": "null",
+                })),
+            ])
+        payload = {"agree": True, "issue_type": None, "supporting_evidence_ids": [],
+                   "correction": None, "summary": "The deterministic result is supported."}
+        return Response([], json.dumps(payload))
+
+
 class AgentSmokeTest(unittest.TestCase):
     def test_bounded_loop_dispatches_mcp_tool_and_keeps_deterministic_plan(self):
         app = Application(ROOT / "dataset")
@@ -91,6 +110,22 @@ class AgentSmokeTest(unittest.TestCase):
                          set(simulation["parameters"]["properties"]))
         self.assertEqual(set(simulation["parameters"]["$defs"]["SpendingChangeInput"]["required"]),
                          set(simulation["parameters"]["$defs"]["SpendingChangeInput"]["properties"]))
+
+    def test_simulate_plan_json_string_null_is_normalised_and_tool_outputs_stay_contiguous(self):
+        app = Application(ROOT / "dataset")
+        fake = SimulatePlanOpenAI()
+        config = AgentConfig(api_key="test-key", ai_mode="enabled", base_url="https://example.invalid/v1")
+        result = AgentRunner(app, mcp, ROOT / "dataset", model_client=fake, config=config).run("request_26")
+
+        self.assertTrue(result.used_ai)
+        self.assertEqual(len(fake.calls), 2)
+        follow_up = fake.calls[1]["input"]
+        output_indexes = [index for index, item in enumerate(follow_up)
+                          if item.get("type") == "function_call_output"]
+        self.assertEqual(output_indexes, list(range(output_indexes[0], output_indexes[-1] + 1)))
+        plan_output = next(item for item in follow_up
+                           if item.get("type") == "function_call_output" and item.get("call_id") == "plan_1")
+        self.assertNotIn("tool call failed", plan_output["output"])
 
 
 if __name__ == "__main__":

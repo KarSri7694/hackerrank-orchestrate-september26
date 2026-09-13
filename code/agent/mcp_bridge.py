@@ -35,12 +35,17 @@ class MCPToolBridge:
         return asyncio.run(self._list())
 
     def call(self, name: str, arguments: dict):
-        return asyncio.run(self._call(name, arguments))
+        return asyncio.run(self._call(name, _normalise_tool_arguments(name, arguments)))
 
     def openai_tools(self):
-        return [{"type": "function", "name": tool.name, "description": tool.description or "",
-                 "parameters": _strict_object_schema(tool.inputSchema), "strict": True}
-                for tool in self.list_tools()]
+        result = []
+        for tool in self.list_tools():
+            schema = getattr(tool, "input_schema", None)
+            if schema is None:  # Compatibility with pre-MCP-SDK-v2 objects.
+                schema = tool.inputSchema
+            result.append({"type": "function", "name": tool.name, "description": tool.description or "",
+                           "parameters": _strict_object_schema(schema), "strict": True})
+        return result
 
 
 def _strict_object_schema(schema):
@@ -71,4 +76,29 @@ def _strict_object_schema(schema):
                 for item in value:
                     visit(item)
     visit(result)
+    return result
+
+
+def _normalise_tool_arguments(name: str, arguments: dict) -> dict:
+    """Repair JSON values that a permissive local model returned as strings.
+
+    The advertised ``simulate_plan`` schema requires ``spending_changes`` to
+    be either an array or null.  Qwen nevertheless emitted the literal JSON
+    strings ``"[]"`` and ``"null"`` in production traces.  FastMCP correctly
+    rejects those strings before the tool function runs.  Decode only those
+    JSON containers, leaving all other invalid values intact for normal schema
+    validation rather than silently accepting arbitrary model output.
+    """
+    if name != "simulate_plan" or not isinstance(arguments, dict):
+        return arguments
+    result = dict(arguments)
+    value = result.get("spending_changes")
+    if not isinstance(value, str):
+        return result
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return result
+    if parsed is None or isinstance(parsed, list):
+        result["spending_changes"] = parsed
     return result

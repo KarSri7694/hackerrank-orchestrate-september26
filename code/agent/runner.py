@@ -133,6 +133,7 @@ class AgentRunner:
                     history.append({"role": "user", "content": [{"type": "input_text", "text": "Return only the critique JSON schema. A payment preference is not a valid critique."}]})
                     continue
             history.extend(response_output_items(response))
+            evidence_to_append: list[str] = []
             for call in calls:
                 if tool_count >= self.max_tool_calls:
                     raise RuntimeError("maximum tool calls exceeded")
@@ -148,7 +149,12 @@ class AgentRunner:
                 tool_count += 1
                 history.append({"type": "function_call_output", "call_id": call["call_id"], "output": json.dumps(result, default=str)})
                 if call["name"] == "inspect_evidence":
-                    self._append_evidence_input(history, arguments.get("evidence_id", ""), seen_images)
+                    evidence_to_append.append(arguments.get("evidence_id", ""))
+            # Chat Completions requires all tool outputs to immediately follow
+            # the assistant tool-call message.  Do not insert a user evidence
+            # message between outputs from parallel tool calls.
+            for evidence_id in evidence_to_append:
+                self._append_evidence_input(history, evidence_id, seen_images)
         return None, self.max_turns, tool_count
 
     def _append_evidence_input(self, history, evidence_id: str, seen_images: set[str]) -> None:

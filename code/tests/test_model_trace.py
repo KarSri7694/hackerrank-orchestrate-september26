@@ -29,6 +29,50 @@ class ModelTraceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 AgentConfig.from_dotenv(path)
 
+    def test_agent_api_is_loaded_and_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text("OPENAI_AGENT_API=CHAT\n", encoding="utf-8")
+            config = AgentConfig.from_dotenv(path)
+        self.assertEqual(config.agent_api, "chat")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text("OPENAI_AGENT_API=legacy\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                AgentConfig.from_dotenv(path)
+
+    def test_chat_agent_request_is_converted_from_responses_shape(self):
+        class Completions:
+            def __init__(self): self.kwargs = []
+            def create(self, **kwargs):
+                self.kwargs.append(kwargs)
+                return {"ok": True}
+        class API:
+            def __init__(self):
+                self.chat = type("Chat", (), {"completions": Completions()})()
+        client = OpenAIResponsesClient.__new__(OpenAIResponsesClient)
+        client.model = "test"
+        client.reasoning_effort = "high"
+        client.use_chat_for_agent = True
+        client.client = API()
+        client.usage_tracker = None
+        client.trace_writer = None
+        client._trace_context = {}
+        client.create(
+            model="test", instructions="Be precise", input=[
+                {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+                {"type": "function_call_output", "call_id": "call-1", "output": "{}"},
+            ], tools=[{"type": "function", "name": "calculator", "description": "calc", "parameters": {}}],
+            max_output_tokens=100, store=False,
+        )
+        request = client.client.chat.completions.kwargs[0]
+        self.assertEqual(request["reasoning_effort"], "high")
+        self.assertEqual(request["max_tokens"], 100)
+        self.assertEqual(request["messages"][0]["role"], "system")
+        self.assertEqual(request["messages"][1]["content"][0]["type"], "text")
+        self.assertEqual(request["messages"][2]["role"], "tool")
+        self.assertEqual(request["tools"][0]["function"]["name"], "calculator")
+
     def test_client_passes_effort_to_both_api_shapes(self):
         class Completions:
             def __init__(self): self.kwargs = []

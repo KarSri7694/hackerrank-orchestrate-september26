@@ -61,12 +61,40 @@ def jsonable(value):
 
 
 def response_output_items(response):
-    return [jsonable(item) for item in getattr(response, "output", [])]
+    output = getattr(response, "output", None)
+    if output is not None:
+        return [jsonable(item) for item in output]
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return []
+    message = getattr(choices[0], "message", None)
+    if message is None:
+        return []
+    # Store a Chat Completions assistant message in the same history shape
+    # accepted by _chat_messages on the next agent turn.
+    return [{
+        "role": "assistant",
+        "content": getattr(message, "content", None),
+        "tool_calls": [jsonable(call) for call in (getattr(message, "tool_calls", None) or [])],
+    }]
 
 
 def response_function_calls(response):
     calls = []
-    for item in getattr(response, "output", []):
+    output = getattr(response, "output", None)
+    if output is None:
+        choices = getattr(response, "choices", None) or []
+        message = getattr(choices[0], "message", None) if choices else None
+        for tool_call in (getattr(message, "tool_calls", None) or []):
+            function = getattr(tool_call, "function", None)
+            if function is not None:
+                calls.append({
+                    "name": getattr(function, "name", None),
+                    "call_id": getattr(tool_call, "id", None),
+                    "arguments": getattr(function, "arguments", "{}"),
+                })
+        return calls
+    for item in output:
         if getattr(item, "type", None) == "function_call":
             calls.append({"name": item.name, "call_id": item.call_id, "arguments": item.arguments})
     return calls
