@@ -9,7 +9,8 @@ import re
 from .adapters.csv_repository import CsvRepository
 from .adapters.evidence_cache import JsonEvidenceCache
 from .adapters.exchange_rates import CsvExchangeRates
-from .core import _optimized_changes, baseline, expand_option, explain_timeline, simulate, solve, validate_changes
+from .core import (_optimized_changes, baseline, candidate_decisions, expand_option,
+                   explain_timeline, simulate, solve, validate_changes)
 from .domain import CorrectionEvaluation, EvidenceFact, EventStatus, Payment, SpendingChange
 from .evidence import EvidenceService
 from .presentation import decision_explanation
@@ -255,6 +256,122 @@ class Application:
 
     def decision(self, request_id: str):
         return solve(self._context(request_id), self.fx)
+
+    def candidate_decisions(self, request_id: str):
+        """Stable, code-generated choices exposed to the two model stages."""
+        return candidate_decisions(self._context(request_id), self.fx)
+
+    def candidate_options(self, request_id: str) -> list[dict[str, object]]:
+        ctx = self._context(request_id)
+        options = []
+        for index, decision in enumerate(candidate_decisions(ctx, self.fx), 1):
+            simulation = simulate(ctx, self.fx, decision.payment_plan, decision.spending_changes)
+            payment_option_id = decision.trace.get("payment_option_id") or None
+            provider_option = next((item for item in ctx.payment_options
+                                    if item.payment_option_id == payment_option_id), None)
+            options.append({
+                "candidate_id": f"candidate_{index:03d}",
+                "affordability_status": decision.affordability_status.value,
+                "recommended_payment_method": decision.recommended_payment_method.value,
+                "amount_safe_to_pay": str(decision.amount_safe_to_pay),
+                "earliest_date_for_full_payment": (decision.earliest_date_for_full_payment.isoformat()
+                                                    if decision.earliest_date_for_full_payment else None),
+                "payment_plan": [{"date": payment.date.isoformat(), "amount": str(payment.amount)}
+                                 for payment in decision.payment_plan],
+                "spending_changes": [{"event_id": change.event_id, "action": change.action,
+                                      "new_amount": str(change.new_amount) if change.new_amount is not None else None}
+                                     for change in decision.spending_changes],
+                "payment_option_id": payment_option_id,
+                "total_payable": decision.trace.get("winner_total"),
+                "financing_fee": str(provider_option.financing_fee) if provider_option else "0",
+                "safe": simulation.safe,
+                "minimum_projected_balance": str(simulation.minimum_projected_balance),
+            })
+        return options
+
+    def payment_options_summary(self, request_id: str) -> dict[str, object]:
+        """Return code-calculated payment terms for model comparison.
+
+        This accepts no model-supplied amount, duration, or schedule. Every
+        returned option is already legal, generated from provider data, and
+        simulator-safe.
+        """
+        options = self.candidate_options(request_id)
+        case = self.case(request_id)
+        summary: dict[str, object] = {
+            "amount_safe_to_pay": case["amount_safe_to_pay"],
+            "earliest_date_for_full_payment": case["earliest_date_for_full_payment"],
+            "full_payment": None,
+            "partial_payment": None,
+            "wait": None,
+            "installments": [],
+        }
+        for option in options:
+            method = option["recommended_payment_method"]
+            if method == "installments":
+                payments = option["payment_plan"]
+                summary["installments"].append({
+                    "candidate_id": option["candidate_id"],
+                    "payment_option_id": option["payment_option_id"],
+                    "payment_amount": payments[0]["amount"] if payments else None,
+                    "number_of_payments": len(payments),
+                    "months": len(payments),
+                    "first_payment_date": payments[0]["date"] if payments else None,
+                    "last_payment_date": payments[-1]["date"] if payments else None,
+                    "payment_plan": payments,
+                    "total_payable": option["total_payable"],
+                    "financing_fee": option["financing_fee"],
+                    "minimum_projected_balance": option["minimum_projected_balance"],
+                })
+            elif method == "full_payment":
+                summary["full_payment"] = option
+            elif method == "partial_payment":
+                summary["partial_payment"] = option
+            elif method == "wait":
+                summary["wait"] = option
+        return summary
+
+    def decision_for_candidate(self, request_id: str, candidate_id: str):
+        if not isinstance(candidate_id, str):
+            return None
+        try:
+            index = int(candidate_id.removeprefix("candidate_")) - 1
+        except ValueError:
+            return None
+        decisions = self.candidate_decisions(request_id)
+        return decisions[index] if 0 <= index < len(decisions) and candidate_id == f"candidate_{index + 1:03d}" else None
+
+    def inspect_source(self, request_id: str, source_type: str, source_id: str) -> dict[str, object]:
+        """Read-only direct-tool implementation for source records."""
+        raw = self.repository.context(request_id)
+        if source_type == "event":
+            event = next((item for item in raw.events if item.event_id == source_id), None)
+            return {"found": bool(event), "source_type": "event",
+                    "record": self._event_payload(event) if event else None}
+        reference = next((item for item in raw.evidence_refs if item.evidence_id == source_id), None)
+        return {"found": bool(reference), "source_type": "evidence", "record": {
+            "evidence_id": reference.evidence_id, "source_type": reference.source_type,
+            "related_event_id": reference.related_event_id,
+            "sent_at": reference.sent_at.isoformat() if reference.sent_at else None,
+            "text": reference.text, "image_available": bool(reference.image_path),
+        } if reference else None}
+
+    def agent_case(self, request_id: str) -> dict[str, object]:
+        """Complete read-only context for decision and critic model calls."""
+        payload = self.case(request_id)
+        raw = self.repository.context(request_id)
+        ctx = self._context(request_id)
+        payload["raw_financial_events"] = [self._event_payload(event) for event in raw.events]
+        payload["resolved_financial_events"] = [self._event_payload(event) for event in ctx.events]
+        payload["evidence"] = [{
+            "evidence_id": ref.evidence_id, "source_type": ref.source_type,
+            "related_event_id": ref.related_event_id,
+            "sent_at": ref.sent_at.isoformat() if ref.sent_at else None,
+            "text": ref.text, "image_available": bool(ref.image_path),
+        } for ref in raw.evidence_refs]
+        payload["forecast"] = explain_timeline(ctx, self.fx)
+        payload["candidates"] = self.candidate_options(request_id)
+        return payload
 
     def explain_timeline(self, request_id: str) -> dict[str, object]:
         """Expose the same reconciled deterministic timeline used by solve."""

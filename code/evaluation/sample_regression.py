@@ -160,13 +160,21 @@ def _field_category(field: str, expected: str, actual: str) -> str:
 
 def evaluate_samples(dataset_dir: str | Path, evidence_extractor=None, progress=None, decision_provider=None,
                      evidence_cache_path: str | Path | None = None,
-                     allow_legacy_evidence_cache: bool = True) -> tuple[SampleResult, ...]:
+                     allow_legacy_evidence_cache: bool = True,
+                     limit: int | None = None, offset: int = 0) -> tuple[SampleResult, ...]:
     dataset_dir = Path(dataset_dir)
     app = Application(dataset_dir, evidence_extractor=evidence_extractor,
                       evidence_cache_path=evidence_cache_path,
                       allow_legacy_evidence_cache=allow_legacy_evidence_cache)
     with (dataset_dir / "sample_requests.csv").open(newline="", encoding="utf-8-sig") as handle:
         rows = list(csv.DictReader(handle))
+    if offset < 0:
+        raise ValueError("sample offset cannot be negative")
+    rows = rows[offset:]
+    if limit is not None:
+        if limit < 1:
+            raise ValueError("sample limit must be positive")
+        rows = rows[:limit]
     # The public samples have their own request IDs and are intentionally not
     # in requests.csv. Overlay only these parsed request rows in memory so the
     # production solver remains unchanged and no sample labels enter it.

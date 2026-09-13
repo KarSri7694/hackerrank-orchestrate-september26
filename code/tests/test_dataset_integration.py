@@ -67,8 +67,38 @@ class DatasetIntegrationTests(unittest.TestCase):
         streams = detect_recurrences(tuple(subscriptions + groceries), date(2024, 4, 1), include_variable_aggregates=True)
         self.assertEqual(len([stream for stream in streams if stream.representative.category == "streaming"]), 1)
         aggregate = next(stream for stream in streams if stream.kind == "variable_category")
-        self.assertEqual(aggregate.representative.amount, Decimal("220"))
+        self.assertEqual(aggregate.representative.amount, Decimal("200"))
         self.assertTrue(aggregate.covered_event_ids.isdisjoint({stream.representative.event_id for stream in streams if stream.kind == "named"}))
+
+    def test_variable_reserve_requires_a_profile_protected_category(self):
+        groceries = [FinancialEvent(f"grocery-{month}", "u", "expense", f"Store {month}", "groceries", "debit",
+                                    Decimal("100"), "USD", date(2024, month, 20), date(2024, month, 20),
+                                    EventStatus.SETTLED, None, "fixed", None)
+                     for month in (1, 2, 3)]
+        excluded = detect_recurrences(tuple(groceries), date(2024, 4, 1),
+                                       include_variable_aggregates=True,
+                                       protected_categories=frozenset({"rent"}))
+        included = detect_recurrences(tuple(groceries), date(2024, 4, 1),
+                                       include_variable_aggregates=True,
+                                       protected_categories=frozenset({"groceries"}))
+        self.assertFalse(any(stream.kind == "variable_category" for stream in excluded))
+        self.assertTrue(any(stream.kind == "variable_category" for stream in included))
+
+    def test_variable_weekly_reserve_uses_median_period_totals_not_purchase_spikes(self):
+        # Four weeks: a single 900 spike must not become the recurring amount.
+        groceries = [FinancialEvent(
+            f"grocery-{index}", "u", "expense", f"Store {index}", "groceries", "debit", Decimal(amount), "USD",
+            day, day, EventStatus.SETTLED, None, "fixed", None,
+        ) for index, (day, amount) in enumerate((
+            (date(2024, 3, 4), "100"), (date(2024, 3, 11), "100"),
+            (date(2024, 3, 18), "900"), (date(2024, 3, 25), "100"),
+        ), 1)]
+        streams = detect_recurrences(groceries, date(2024, 4, 1), include_variable_aggregates=True,
+                                     protected_categories=frozenset({"groceries"}))
+        reserve = next(stream for stream in streams if stream.kind == "variable_category")
+        self.assertEqual(reserve.representative.amount, Decimal("100"))
+        self.assertEqual(reserve.cadence_days, 7)
+        self.assertEqual(reserve.starts_on, date(2024, 4, 1))
 
     def test_category_only_activity_does_not_become_a_recurring_stream(self):
         exact = [FinancialEvent(

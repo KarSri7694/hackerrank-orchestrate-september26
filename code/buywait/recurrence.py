@@ -5,6 +5,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
+from decimal import Decimal
 
 from .domain import EventStatus, FinancialEvent
 
@@ -111,21 +112,35 @@ VARIABLE_ESSENTIAL_DEBIT_CATEGORIES = frozenset({
 })
 
 
-def _variable_category_streams(events: list[FinancialEvent], covered: set[str], as_of: date | None) -> list[RecurringStream]:
-    """Build conservative monthly debit reserves from *uncovered* merchants.
+def _median(values: list[Decimal]) -> Decimal:
+    """Return a deterministic, spike-resistant median for cash reserves."""
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / Decimal("2")
+
+
+def _variable_category_streams(events: list[FinancialEvent], covered: set[str], as_of: date | None,
+                               protected_categories: frozenset[str] | set[str] | None) -> list[RecurringStream]:
+    """Build conservative reserves from protected, uncovered merchant activity.
 
     A named subscription/rent stream owns its own history.  Other essential
     debit activity is grouped by calendar month so changing merchants does not
-    erase an ordinary grocery or transport commitment.  Three completed
-    months are required and the high observed monthly total is reserved.
+    erase an ordinary protected commitment. Three completed months are
+    required and an upper-quartile recent amount is reserved.
     """
     if as_of is None:
         return []
+    # ``None`` preserves the standalone detector's historic grocery/transport
+    # behavior. The finance core always supplies the profile's protected set,
+    # so it never reserves a discretionary category solely from transaction
+    # history.
+    allowed = ({category.casefold() for category in protected_categories}
+               if protected_categories is not None else VARIABLE_ESSENTIAL_DEBIT_CATEGORIES)
     by_category_currency: dict[tuple[str, str], dict[tuple[int, int], list[FinancialEvent]]] = defaultdict(lambda: defaultdict(list))
     for event in events:
         if (event.event_id in covered or event.status != EventStatus.SETTLED
                 or event.amount is None or event.direction != "debit"
-                or event.category.strip().lower() not in VARIABLE_ESSENTIAL_DEBIT_CATEGORIES
+                or event.category.strip().casefold() not in allowed
                 # A current partial month is not a completed historical
                 # period and cannot justify reserving a full monthly total.
                 or cash_date(event) >= date(as_of.year, as_of.month, 1)):
@@ -139,16 +154,28 @@ def _variable_category_streams(events: list[FinancialEvent], covered: set[str], 
         # coarse for a payment-safety timeline. When the last six purchases
         # support a stable 5–14 day cadence, reserve the conservative largest
         # observed amount at that actual cadence instead.
-        recent = all_events[-6:]
-        if len(recent) >= 6:
-            gaps = [(cash_date(right) - cash_date(left)).days for left, right in zip(recent, recent[1:])]
-            median_gap = sorted(gaps)[len(gaps) // 2]
-            if 5 <= median_gap <= 14 and all(abs(gap - median_gap) <= 2 for gap in gaps):
-                representative = replace(recent[-1], amount=max((event.amount or 0) for event in recent),
-                                         flexibility="fixed")
-                streams.append(RecurringStream(representative, median_gap, kind="variable_category",
-                                               covered_event_ids=frozenset(event.event_id for event in all_events)))
-                continue
+        current_week = as_of - timedelta(days=as_of.weekday())
+        first_week = current_week - timedelta(days=56)
+        weeks: dict[date, list[FinancialEvent]] = defaultdict(list)
+        for event in all_events:
+            week_start = cash_date(event) - timedelta(days=cash_date(event).weekday())
+            if first_week <= week_start < current_week:
+                weeks[week_start].append(event)
+        ordered_weeks = sorted(weeks)
+        # Four active completed weeks with no two-week hole demonstrate a
+        # genuine variable-spending rate. Reserve the median weekly total,
+        # never an upper-quartile individual transaction.
+        if (len(ordered_weeks) >= 4
+                and all((right - left).days <= 14 for left, right in zip(ordered_weeks, ordered_weeks[1:]))):
+            recent_weeks = ordered_weeks[-8:]
+            weekly_totals = [sum((event.amount or Decimal("0")) for event in weeks[key]) for key in recent_weeks]
+            latest = max(weeks[recent_weeks[-1]], key=cash_date)
+            representative = replace(latest, amount=_median(weekly_totals), flexibility="fixed")
+            streams.append(RecurringStream(
+                representative, 7, starts_on=recent_weeks[-1] + timedelta(days=7), kind="variable_category",
+                covered_event_ids=frozenset(event.event_id for event in all_events),
+            ))
+            continue
         if len(months) < 3:
             continue
         # Do not invent a monthly reserve from sparse/seasonal history.
@@ -156,19 +183,18 @@ def _variable_category_streams(events: list[FinancialEvent], covered: set[str], 
         if len(ordered_months) < 3 or any((right[0] * 12 + right[1]) - (left[0] * 12 + left[1]) != 1
                for left, right in zip(ordered_months, ordered_months[1:])):
             continue
-        monthly_totals = [sum((event.amount or 0) for event in months[key]) for key in ordered_months]
+        monthly_totals = [sum((event.amount or Decimal("0")) for event in months[key]) for key in ordered_months]
         latest_events = months[ordered_months[-1]]
         latest = max(latest_events, key=cash_date)
-        # Use the first of the month for a reserve: it is intentionally
-        # conservative and avoids assuming a later merchant purchase date.
-        representative = replace(latest, amount=max(monthly_totals), flexibility="fixed")
+        representative = replace(latest, amount=_median(monthly_totals), flexibility="fixed")
         streams.append(RecurringStream(representative, 30,
-                                       anchor_day=1, kind="variable_category",
+                                       anchor_day=cash_date(latest).day, kind="variable_category",
                                        covered_event_ids=frozenset(event.event_id for values in months.values() for event in values)))
     return streams
 
 
-def detect_recurrences(events, as_of: date | None = None, *, include_variable_aggregates: bool = False) -> tuple[RecurringStream, ...]:
+def detect_recurrences(events, as_of: date | None = None, *, include_variable_aggregates: bool = False,
+                       protected_categories: frozenset[str] | set[str] | None = None) -> tuple[RecurringStream, ...]:
     eligible = [event for event in events if event.status == EventStatus.SETTLED and event.amount is not None
                 and event.event_type != "internal_transfer"
                 and (event.direction != "credit" or event.category != "salary"
@@ -216,12 +242,11 @@ def detect_recurrences(events, as_of: date | None = None, *, include_variable_ag
         if stream:
             streams.append(stream)
             covered_event_ids.update(event.event_id for event in values)
-    # Category aggregation is intentionally opt-in. The contest data model
-    # does not mark which profiles authorize a monthly category budget or its
-    # intra-month timing; callers with such a policy can use the conservative
-    # detector without silently converting merchant history into obligations.
+    # Category aggregation remains opt-in for generic callers. The finance
+    # core opts in with profile-protected categories only, which is the
+    # dataset's explicit authorization to reserve essential variable spending.
     if include_variable_aggregates:
-        streams.extend(_variable_category_streams(eligible, covered_event_ids, as_of))
+        streams.extend(_variable_category_streams(eligible, covered_event_ids, as_of, protected_categories))
     aggregates = [event for event in events if event.event_type == "aggregate_stream_update" and event.recurrence_days and event.recurrence_days > 0 and event.status in {EventStatus.SCHEDULED, EventStatus.SETTLED} and event.amount is not None]
     for aggregate in aggregates:
         # Historical streams keep their history but stop forecasting once the

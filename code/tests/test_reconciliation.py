@@ -91,6 +91,19 @@ class ReconciliationTests(unittest.TestCase):
         result = simulate(context((credit, debit)), type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})())
         self.assertEqual(result.ending_balance, Decimal("900"))
 
+    def test_confirmed_same_day_credit_is_available_to_payment(self):
+        credit = event("salary", Decimal("500"), "credit", EventStatus.SCHEDULED)
+        fx = type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})()
+        result = simulate(context((credit,)), fx, (Payment(date(2025, 1, 1), Decimal("1000")),))
+        self.assertTrue(result.safe)
+        self.assertIsNone(result.first_violation_date)
+
+    def test_baseline_uses_simulator_for_cent_precise_safe_amount(self):
+        debit = event("bill", Decimal("499.995"), "debit", EventStatus.SCHEDULED)
+        fx = type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})()
+        safe, _ = baseline(context((debit,)), fx)
+        self.assertEqual(safe, Decimal("0.00"))
+
     def test_simulator_rejects_payment_outside_forecast_instead_of_ignoring_it(self):
         fx = type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})()
         with self.assertRaises(ValueError):

@@ -1,178 +1,49 @@
 from __future__ import annotations
 
-import json
 import sys
 import unittest
-from datetime import date
-from decimal import Decimal
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "code"))
 
-from agent.config import AgentConfig  # noqa: E402
-from agent.runner import AgentRunner  # noqa: E402
-from buywait.domain import (AffordabilityStatus, CorrectionEvaluation, DecisionCore,
-                            EvidenceFact, EvidenceReference, Payment, PaymentMethod)  # noqa: E402
 from buywait.application import Application  # noqa: E402
-from tools.server import mcp  # noqa: E402
 
 
-def decision(method=PaymentMethod.FULL, amount="100"):
-    payments = (Payment(date(2025, 1, 1), Decimal(amount)),) if method != PaymentMethod.NOT_RECOMMENDED else ()
-    return DecisionCore("r", Decimal("25"), AffordabilityStatus.NOW if payments else AffordabilityStatus.NOT_AFFORDABLE,
-                        method, payments, date(2025, 1, 1), (), {})
+class CandidateContractTests(unittest.TestCase):
+    def setUp(self):
+        self.app = Application(ROOT / "dataset")
 
+    def test_each_exposed_candidate_round_trips_to_a_safe_core_decision(self):
+        request_id = "request_26"
+        candidates = self.app.candidate_options(request_id)
+        self.assertTrue(candidates)
+        for candidate in candidates:
+            decision = self.app.decision_for_candidate(request_id, candidate["candidate_id"])
+            self.assertIsNotNone(decision)
+            result = self.app.simulate_plan(request_id, decision.payment_plan, decision.spending_changes)
+            self.assertTrue(result.safe or not decision.payment_plan)
 
-class Response:
-    output = ()
-    def __init__(self, payload):
-        self.output_text = json.dumps(payload)
+    def test_invalid_candidate_id_is_rejected_without_changing_financial_state(self):
+        self.assertIsNone(self.app.decision_for_candidate("request_26", "candidate_999"))
+        self.assertIsNone(self.app.decision_for_candidate("request_26", "arbitrary-plan"))
 
+    def test_agent_case_contains_all_user_history_and_unredacted_message_text(self):
+        case = self.app.agent_case("request_26")
+        raw = self.app.repository.context("request_26")
+        self.assertEqual(len(case["raw_financial_events"]), len(raw.events))
+        self.assertEqual(len(case["evidence"]), len(raw.evidence_refs))
 
-class FakeClient:
-    model = "fake"
-    def __init__(self, payloads):
-        self.payloads = iter(payloads)
-        self.calls = 0
-    def create(self, **_kwargs):
-        self.calls += 1
-        return Response(next(self.payloads))
-
-
-class FakeApplication:
-    def __init__(self, decisions, evaluations=()):
-        self.decisions = list(decisions)
-        self.index = 0
-        self.evaluations = iter(evaluations)
-        self.applied = []
-        self.evaluated = []
-    def decision(self, _request_id):
-        return self.decisions[self.index]
-    def case(self, _request_id):
-        return {"request_id": "r", "evidence_refs": [{"evidence_id": "message_1"}]}
-    def evaluate_correction(self, request_id, facts, support):
-        self.evaluated.append((request_id, facts, support))
-        return next(self.evaluations)
-    def apply_correction(self, facts):
-        self.applied.append(facts)
-        self.index = min(self.index + 1, len(self.decisions) - 1)
-
-
-def agree():
-    return {"agree": True, "issue_type": None, "supporting_evidence_ids": [], "correction": None, "summary": "agrees"}
-
-
-def correction(issue="wrong_stream_termination", effect="terminate", related=None):
-    return {
-        "agree": False, "issue_type": issue, "supporting_evidence_ids": ["message_1"],
-        "correction": {"evidence_id": "message_1", "effect": effect, "related_event_id": related,
-                       "amount": None, "currency": None, "effective_date": "2025-01-01",
-                       "status": "scheduled", "category": "salary", "direction": "credit",
-                       "description": "explicit evidence", "recurring": False, "recurrence_days": None,
-                       "flexibility": "fixed", "minimum_allowed_amount": None},
-        "summary": "Evidence identifies a state error.",
-    }
-
-
-class AgentCriticTests(unittest.TestCase):
-    def runner(self, app, payloads, rounds=2):
-        config = AgentConfig(api_key="test", ai_mode="enabled", max_critique_rounds=rounds)
-        return AgentRunner(app, mcp, ROOT / "dataset", model_client=FakeClient(payloads), config=config)
-
-    def test_agent_agrees_with_deterministic_result(self):
-        app = FakeApplication([decision()])
-        result = self.runner(app, [agree()]).run("r")
-        self.assertEqual(result.decision.recommended_payment_method, PaymentMethod.FULL)
-        self.assertFalse(app.applied)
-        self.assertEqual(result.decision.trace["agent_critique"], "agent_agreed")
-
-    def test_terminated_salary_correction_changes_result(self):
-        initial, corrected = decision(), decision(PaymentMethod.NOT_RECOMMENDED)
-        fact_payload = correction()
-        from buywait.domain import EvidenceFact
-        accepted = CorrectionEvaluation(True, "verified", corrected, (EvidenceFact("message_1", "terminate", category="salary", direction="credit", effective_date=date(2025, 1, 1)),))
-        app = FakeApplication([initial, corrected], [accepted])
-        result = self.runner(app, [fact_payload, agree()]).run("r")
-        self.assertEqual(result.decision.recommended_payment_method, PaymentMethod.NOT_RECOMMENDED)
-        self.assertEqual(app.applied[0][0].effect, "terminate")
-
-    def test_internal_transfer_correction_is_structured(self):
-        initial, corrected = decision(), decision(PaymentMethod.WAIT)
-        payload = correction("internal_transfer", "internal_transfer", "transfer_1")
-        from buywait.domain import EvidenceFact
-        accepted = CorrectionEvaluation(True, "verified", corrected, (EvidenceFact("message_1", "internal_transfer", "transfer_1"),))
-        app = FakeApplication([initial, corrected], [accepted])
-        result = self.runner(app, [payload, agree()]).run("r")
-        self.assertEqual(result.decision.recommended_payment_method, PaymentMethod.WAIT)
-        self.assertEqual(app.evaluated[0][1][0].effect, "internal_transfer")
-
-    def test_vague_or_unverifiable_critique_is_rejected(self):
-        app = FakeApplication([decision()])
-        vague = {"agree": False, "issue_type": "incorrect_recurrence", "supporting_evidence_ids": [], "correction": None, "summary": "safer"}
-        result = self.runner(app, [vague]).run("r")
-        self.assertFalse(app.evaluated)
-        self.assertEqual(result.decision.trace["agent_critique"], "rejected_vague_or_missing_correction")
-
-    def test_unsafe_correction_is_rejected(self):
-        base = decision()
-        app = FakeApplication([base], [CorrectionEvaluation(False, "correction produced an unsafe plan", base)])
-        result = self.runner(app, [correction()]).run("r")
-        self.assertEqual(result.decision.recommended_payment_method, base.recommended_payment_method)
-        self.assertFalse(app.applied)
-        self.assertIn("unsafe plan", result.decision.trace["agent_critique"])
-
-    def test_safe_plan_preference_without_fact_correction_cannot_replace_ranking(self):
-        app = FakeApplication([decision()])
-        result = self.runner(app, [{"agree": False, "issue_type": "incorrect_recurrence", "supporting_evidence_ids": ["message_1"], "correction": None, "summary": "I prefer installments."}]).run("r")
-        self.assertEqual(result.decision.recommended_payment_method, PaymentMethod.FULL)
-        self.assertFalse(app.applied)
-
-    def test_loop_stops_at_configured_maximum_rounds(self):
-        first, second, third = decision(), decision(PaymentMethod.WAIT), decision(PaymentMethod.NOT_RECOMMENDED)
-        from buywait.domain import EvidenceFact
-        fact = EvidenceFact("message_1", "terminate", category="salary", direction="credit", effective_date=date(2025, 1, 1))
-        app = FakeApplication([first, second, third], [CorrectionEvaluation(True, "verified", second, (fact,)), CorrectionEvaluation(True, "verified", third, (fact,))])
-        client = FakeClient([correction(), correction(), correction()])
-        config = AgentConfig(api_key="test", ai_mode="enabled", max_critique_rounds=2)
-        result = AgentRunner(app, mcp, ROOT / "dataset", model_client=client, config=config).run("r")
-        self.assertEqual(client.calls, 2)
-        self.assertEqual(len(app.applied), 2)
-        self.assertEqual(result.decision.recommended_payment_method, third.recommended_payment_method)
-        self.assertEqual(result.decision.trace["agent_critique"], "critique_round_limit_reached")
-
-    def test_correction_support_requires_every_extracted_field_to_match(self):
-        reference = EvidenceReference("image_1", "image", "u")
-        app = Application.__new__(Application)
-        app.evidence_service = type("Evidence", (), {"inspect": lambda _self, _id: (EvidenceFact("image_1", "amend", amount=None, currency="USD"),)})()
-        raw = type("Raw", (), {"evidence_refs": (reference,)})()
-        unsupported = EvidenceFact("image_1", "amend", amount=Decimal("500"), currency="USD")
-        self.assertFalse(app._fact_is_supported(raw, unsupported))
-
-    def test_text_fallback_rejects_unsupported_inferred_fields(self):
-        reference = EvidenceReference("message_1", "employer", "u", text="Employer A salary has ended.")
-        app = Application.__new__(Application)
-        app.evidence_service = type("Evidence", (), {"inspect": lambda _self, _id: ()})()
-        raw = type("Raw", (), {"evidence_refs": (reference,)})()
-        inferred = EvidenceFact("message_1", "terminate", amount=Decimal("500"), category="salary", direction="credit")
-        self.assertFalse(app._fact_is_supported(raw, inferred))
-
-    def test_semantic_text_support_allows_constrained_multilingual_stream_correction(self):
-        reference = EvidenceReference("message_zh", "employer", "u", text="Cobalt Systems 的雇佣关系已结束")
-        app = Application.__new__(Application)
-        app.evidence_service = type("Evidence", (), {"inspect": lambda _self, _id: ()})()
-        raw = type("Raw", (), {"evidence_refs": (reference,)})()
-        correction = EvidenceFact("message_zh", "terminate", category="salary", direction="credit", stream_source="Cobalt Systems")
-        self.assertTrue(app._fact_is_supported(raw, correction))
-
-    def test_image_amount_correction_requires_exact_structured_vlm_fact(self):
-        reference = EvidenceReference("image_1", "image", "u", related_event_id="event_1")
-        supported = EvidenceFact("image_1", "image_amount", "event_1", Decimal("500"), "USD")
-        app = Application.__new__(Application)
-        app.evidence_service = type("Evidence", (), {"inspect": lambda _self, _id: (supported,)})()
-        raw = type("Raw", (), {"evidence_refs": (reference,)})()
-        self.assertTrue(app._fact_is_supported(raw, supported))
-        self.assertFalse(app._fact_is_supported(raw, EvidenceFact("image_1", "image_amount", "event_1", Decimal("501"), "USD")))
+    def test_payment_options_summary_exposes_only_precomputed_terms(self):
+        summary = self.app.payment_options_summary("request_26")
+        self.assertIn("amount_safe_to_pay", summary)
+        self.assertIn("earliest_date_for_full_payment", summary)
+        for plan in summary["installments"]:
+            self.assertIn("candidate_id", plan)
+            self.assertIn("payment_amount", plan)
+            self.assertIn("number_of_payments", plan)
+            self.assertIn("months", plan)
+            self.assertIn("financing_fee", plan)
 
 
 if __name__ == "__main__":

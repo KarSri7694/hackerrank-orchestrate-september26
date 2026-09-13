@@ -15,6 +15,14 @@ from .recurrence import detect_recurrences, event_stream_key, recurring_event_id
 ZERO = Decimal("0")
 
 
+def _forecast_streams(ctx: RequestContext):
+    """Use protected-category reserves only for deterministic cash safety."""
+    return detect_recurrences(
+        ctx.events, ctx.request.request_date, include_variable_aggregates=True,
+        protected_categories=ctx.profile.protected_categories,
+    )
+
+
 def _cash(event: FinancialEvent, home_currency: str, fx, on_date: date) -> Decimal:
     if event.amount is None:
         return ZERO
@@ -74,7 +82,7 @@ def _effective_events(ctx: RequestContext, fx, duplicate_suppressions: list[dict
             event_day = request_date
         if event_day >= request_date and event_day <= end:
             rows.append((event_day, _cash(event, ctx.profile.home_currency, fx, event_day), event.event_id, event))
-    for stream in detect_recurrences(ctx.events, request_date):
+    for stream in _forecast_streams(ctx):
         last = stream.representative
         next_day = stream.starts_on or last.settlement_date or last.event_date
         while next_day < request_date:
@@ -166,6 +174,8 @@ def simulate(ctx: RequestContext, fx, payments: tuple[Payment, ...] = (), change
     changes_by_id = {c.event_id: c for c in changes}
     timeline = _effective_events(ctx, fx)
     balances = ctx.profile.current_available_balance
+    # Confirmed cash events settle on their stated day and are available to a
+    # payment on that date. This ordering also matches the dated data contract.
     by_day: dict[date, list[tuple[Decimal, str, FinancialEvent | None]]] = defaultdict(list)
     for day, amount, event_id, event in timeline:
         by_day[day].append((amount, event_id, event))
@@ -187,12 +197,30 @@ def simulate(ctx: RequestContext, fx, payments: tuple[Payment, ...] = (), change
     return SimulationResult(violation is None, lowest, minimum, violation, shortfall, balances)
 
 
+def _maximum_safe_payment(ctx: RequestContext, fx, on_date: date, ceiling: Decimal) -> Decimal:
+    """Find the largest cent-precise payment accepted by the same simulator."""
+    if ceiling <= ZERO or not simulate(ctx, fx).safe:
+        return ZERO
+    if simulate(ctx, fx, (Payment(on_date, ceiling),)).safe:
+        return ceiling
+    cents = Decimal("0.01")
+    low, high = 0, int((ceiling / cents).to_integral_value(rounding=ROUND_DOWN))
+    while low < high:
+        middle = (low + high + 1) // 2
+        amount = cents * middle
+        if simulate(ctx, fx, (Payment(on_date, amount),)).safe:
+            low = middle
+        else:
+            high = middle - 1
+    return (cents * low).quantize(cents, rounding=ROUND_DOWN)
+
+
 def baseline(ctx: RequestContext, fx) -> tuple[Decimal, date | None]:
     ctx = reconcile_context(ctx)
-    base = simulate(ctx, fx)
-    # The minimum projected balance already includes all required future cash flows.
-    safe_today = max(ZERO, base.minimum_projected_balance - ctx.profile.minimum_balance_to_keep)
-    safe_today = min(ctx.request.requested_amount, safe_today)
+    # Do not derive the amount from a baseline minimum. The payment may occur
+    # before same-day cash events, and the simulator is the single authority
+    # for all payment methods and dates.
+    safe_today = _maximum_safe_payment(ctx, fx, ctx.request.request_date, ctx.request.requested_amount)
     earliest = None
     for offset in range(90):
         day = ctx.request.request_date + timedelta(days=offset)
@@ -213,7 +241,7 @@ def explain_timeline(ctx: RequestContext, fx) -> dict[str, object]:
     ctx = reconcile_context(ctx)
     request_date = ctx.request.request_date
     end = request_date + timedelta(days=89)
-    streams = detect_recurrences(ctx.events, request_date)
+    streams = _forecast_streams(ctx)
     suppressions: list[dict[str, str]] = []
     rows = _effective_events(ctx, fx, suppressions)
     explicit_ids = {
@@ -389,7 +417,13 @@ def _optimized_changes(ctx: RequestContext, fx, payments: tuple[Payment, ...], m
     return list(sorted(safe, key=lambda item: item[0])[0][1]) if safe else None
 
 
-def solve(ctx: RequestContext, fx) -> DecisionCore:
+def candidate_decisions(ctx: RequestContext, fx) -> tuple[DecisionCore, ...]:
+    """Return every deterministic, legal, safe decision in preference order.
+
+    Models may select only from this list.  Keeping candidate construction in
+    the finance core means no model response can invent arithmetic, dates, or
+    a payment schedule.
+    """
     ctx = reconcile_context(ctx)
     safe_today, earliest = baseline(ctx, fx)
     req = ctx.request
@@ -422,9 +456,27 @@ def solve(ctx: RequestContext, fx) -> DecisionCore:
             if changes:
                 safe_candidates.append(PlanCandidate(candidate.method, candidate.payments, candidate.total_payable, tuple(changes), candidate.payment_option_id))
     if not safe_candidates:
-        return DecisionCore(req.request_id, safe_today, AffordabilityStatus.NOT_AFFORDABLE, PaymentMethod.NOT_RECOMMENDED, (), earliest, (), {"minimum_balance": str(ctx.profile.minimum_balance_to_keep)})
+        return (DecisionCore(req.request_id, safe_today, AffordabilityStatus.NOT_AFFORDABLE,
+                             PaymentMethod.NOT_RECOMMENDED, (), earliest, (),
+                             {"minimum_balance": str(ctx.profile.minimum_balance_to_keep)}),)
     def rank(c: PlanCandidate):
         return (0 if c.payments[-1].date <= req.desired_completion_date else 1, 0 if not c.spending_changes else 1, c.total_payable, c.payments[0].date, len(c.payments), _option_order(c.payment_option_id))
-    winner = sorted(safe_candidates, key=rank)[0]
-    status = AffordabilityStatus.NOW if winner.method == PaymentMethod.FULL and winner.payments[0].date == req.request_date and not winner.spending_changes else AffordabilityStatus.LATER if winner.method == PaymentMethod.WAIT else AffordabilityStatus.WITH_PLAN
-    return DecisionCore(req.request_id, safe_today, status, winner.method, winner.payments, earliest, winner.spending_changes, {"minimum_balance": str(ctx.profile.minimum_balance_to_keep), "winner_total": str(winner.total_payable)})
+    decisions = []
+    for candidate in sorted(safe_candidates, key=rank):
+        status = (AffordabilityStatus.NOW if candidate.method == PaymentMethod.FULL
+                  and candidate.payments[0].date == req.request_date and not candidate.spending_changes
+                  else AffordabilityStatus.LATER if candidate.method == PaymentMethod.WAIT
+                  else AffordabilityStatus.WITH_PLAN)
+        decisions.append(DecisionCore(
+            req.request_id, safe_today, status, candidate.method, candidate.payments,
+            earliest, candidate.spending_changes,
+            {"minimum_balance": str(ctx.profile.minimum_balance_to_keep),
+             "winner_total": str(candidate.total_payable),
+             "payment_option_id": candidate.payment_option_id or ""},
+        ))
+    return tuple(decisions)
+
+
+def solve(ctx: RequestContext, fx) -> DecisionCore:
+    """Return the deterministic first-choice candidate for non-AI operation."""
+    return candidate_decisions(ctx, fx)[0]
