@@ -283,13 +283,16 @@ def explain_timeline(ctx: RequestContext, fx) -> dict[str, object]:
             continue
         ignored.append({"event_id": event.event_id, "reason": reason})
     return {
+        "forecast_horizon_days": 90,
         "opening_balance": str(ctx.profile.current_available_balance),
         "minimum_balance_to_keep": str(ctx.profile.minimum_balance_to_keep),
         "streams": [{"event_id": stream.representative.event_id, "kind": stream.kind,
                      "category": stream.representative.category, "direction": stream.representative.direction,
                      "currency": stream.representative.currency, "amount": str(stream.representative.amount),
                      "cadence_days": stream.cadence_days,
-                     "covered_event_ids": sorted(stream.covered_event_ids)} for stream in streams],
+                     "covered_event_ids": sorted(stream.covered_event_ids),
+                     "reserve_period_kind": stream.reserve_period_kind,
+                     "reserve_period_totals": [str(total) for total in stream.reserve_period_totals]} for stream in streams],
         "ignored_events": ignored,
         "duplicate_suppressed_events": suppressions,
         "projected_events": projected,

@@ -23,6 +23,8 @@ class AgentConfig:
     evidence_timeout: float = 180.0
     max_turns: int = 2
     max_tool_calls: int = 8
+    max_decision_retries: int = 2
+    request_poll_seconds: float = 5.0
     max_evidence_calls: int = 4
     max_critique_rounds: int = 2
     max_output_tokens: int = 8192
@@ -58,6 +60,8 @@ class AgentConfig:
             evidence_timeout=float(value("OPENAI_EVIDENCE_TIMEOUT", "180")),
             max_turns=min(int(value("AGENT_MAX_TURNS", "2")), 6),
             max_tool_calls=min(int(value("AGENT_MAX_TOOL_CALLS", "8")), 12),
+            max_decision_retries=min(max(0, int(value("AGENT_MAX_DECISION_RETRIES", "2"))), 5),
+            request_poll_seconds=min(max(0.1, float(value("REQUESTS_POLL_SECONDS", "5"))), 300.0),
             max_evidence_calls=min(int(value("AGENT_MAX_EVIDENCE_CALLS", "4")), 8),
             max_critique_rounds=min(max(1, int(value("AGENT_MAX_CRITIQUE_ROUNDS", "2"))), 2),
             max_output_tokens=min(max(1024, int(value("AGENT_MAX_OUTPUT_TOKENS", "8192"))), 32768),

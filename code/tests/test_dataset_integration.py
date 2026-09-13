@@ -100,6 +100,21 @@ class DatasetIntegrationTests(unittest.TestCase):
         self.assertEqual(reserve.cadence_days, 7)
         self.assertEqual(reserve.starts_on, date(2024, 4, 1))
 
+    def test_named_protected_stream_suppresses_same_category_variable_reserve(self):
+        named = [FinancialEvent(
+            f"market-{month}", "u", "expense", "Neighbourhood Market", "groceries", "debit", Decimal("100"), "USD",
+            date(2024, month, 5), date(2024, month, 5), EventStatus.SETTLED, None, "fixed", None,
+        ) for month in (1, 2, 3)]
+        rotating = [FinancialEvent(
+            f"shop-{index}", "u", "expense", f"Shop {index}", "groceries", "debit", Decimal("25"), "USD",
+            day, day, EventStatus.SETTLED, None, "fixed", None,
+        ) for index, day in enumerate((date(2024, 3, 4), date(2024, 3, 11), date(2024, 3, 18), date(2024, 3, 25)), 1)]
+        streams = detect_recurrences(named + rotating, date(2024, 4, 1), include_variable_aggregates=True,
+                                     protected_categories=frozenset({"groceries"}))
+        groceries = [stream for stream in streams if stream.representative.category == "groceries"]
+        self.assertEqual(len(groceries), 1)
+        self.assertEqual(groceries[0].kind, "named")
+
     def test_category_only_activity_does_not_become_a_recurring_stream(self):
         exact = [FinancialEvent(
             f"subscription-{month}", "u", "expense", "Dining subscription", "dining", "debit", Decimal("20"), "USD",

@@ -64,6 +64,27 @@ class AgentSmokeTests(unittest.TestCase):
         result = AgentRunner(self.app, ROOT / "dataset", model_client=client, config=self.config).run("request_26")
         self.assertEqual(result.decision, self.app.candidate_decisions("request_26")[0])
 
+    def test_malformed_selection_is_retried_before_accepting_a_valid_response(self):
+        config = AgentConfig(api_key="test", ai_mode="enabled", max_turns=1, max_decision_retries=1)
+        client = FakeClient([
+            {"candidate_id": "candidate_001"},
+            {"request_id": "request_26", "candidate_id": "candidate_001", "explanation": "Best option.", "evidence_used": []},
+            {"approved": True, "candidate_id": "candidate_001", "explanation": "Verified."},
+        ])
+        result = AgentRunner(self.app, ROOT / "dataset", model_client=client, config=config).run("request_26")
+        self.assertTrue(result.used_ai)
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(result.decision, self.app.candidate_decisions("request_26")[0])
+
+    def test_exhausted_malformed_retries_use_the_deterministic_decision(self):
+        config = AgentConfig(api_key="test", ai_mode="enabled", max_turns=1, max_decision_retries=1)
+        client = FakeClient([{}, {}])
+        result = AgentRunner(self.app, ROOT / "dataset", model_client=client, config=config).run("request_26")
+        self.assertFalse(result.used_ai)
+        self.assertEqual(result.decision, self.app.decision("request_26"))
+        self.assertEqual(result.fallback_reason, "malformed AI response after 2 attempt(s)")
+        self.assertEqual(len(client.calls), 2)
+
     def test_direct_tools_are_read_only(self):
         runner = AgentRunner(self.app, ROOT / "dataset", config=self.config)
         event_id = self.app.repository.context("request_26").events[0].event_id

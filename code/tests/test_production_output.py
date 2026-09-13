@@ -23,6 +23,7 @@ from buywait.output import OUTPUT_COLUMNS, decision_row, write_output  # noqa: E
 from buywait.presentation import decision_explanation  # noqa: E402
 from buywait.evidence_validation import text_supports_amount, text_supports_date  # noqa: E402
 from evaluation.output_validation import OutputValidationError, _validate_explanation, validate_output  # noqa: E402
+from main import appended_request_ids  # noqa: E402
 
 
 class ProductionOutputTests(unittest.TestCase):
@@ -554,6 +555,12 @@ class ProductionOutputTests(unittest.TestCase):
         source = (ROOT / "code" / "main.py").read_text(encoding="utf-8")
         self.assertIn("write_output(temporary_path, decisions)", source)
         self.assertIn("flush=True", source)
+
+    def test_watch_queue_accepts_only_append_only_request_ids(self):
+        self.assertEqual(appended_request_ids(("request_01",), ("request_01", "request_02")), ("request_02",))
+        self.assertEqual(appended_request_ids(("request_01",), ("request_01",)), ())
+        with self.assertRaises(ValueError):
+            appended_request_ids(("request_01",), ("request_99", "request_02"))
 
 
 if __name__ == "__main__":

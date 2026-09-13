@@ -58,6 +58,8 @@ class RecurringStream:
     # accidentally turn an arbitrary grocery purchase into a reducible stream.
     kind: str = "named"
     covered_event_ids: frozenset[str] = frozenset()
+    reserve_period_kind: str | None = None
+    reserve_period_totals: tuple[Decimal, ...] = ()
 
     def next_date(self, value: date) -> date:
         if 25 <= self.cadence_days <= 35:
@@ -119,14 +121,15 @@ def _median(values: list[Decimal]) -> Decimal:
     return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / Decimal("2")
 
 
-def _variable_category_streams(events: list[FinancialEvent], covered: set[str], as_of: date | None,
+def _variable_category_streams(events: list[FinancialEvent], covered: set[str],
+                               named_category_currencies: set[tuple[str, str, str]], as_of: date | None,
                                protected_categories: frozenset[str] | set[str] | None) -> list[RecurringStream]:
     """Build conservative reserves from protected, uncovered merchant activity.
 
-    A named subscription/rent stream owns its own history.  Other essential
-    debit activity is grouped by calendar month so changing merchants does not
-    erase an ordinary protected commitment. Three completed months are
-    required and an upper-quartile recent amount is reserved.
+    A named stream owns its category/currency. Other protected debit activity
+    becomes a weekly or monthly reserve only when completed periods support
+    it. This prevents a named grocery stream and a grocery aggregate from
+    charging the same essential category twice.
     """
     if as_of is None:
         return []
@@ -141,9 +144,8 @@ def _variable_category_streams(events: list[FinancialEvent], covered: set[str], 
         if (event.event_id in covered or event.status != EventStatus.SETTLED
                 or event.amount is None or event.direction != "debit"
                 or event.category.strip().casefold() not in allowed
-                # A current partial month is not a completed historical
-                # period and cannot justify reserving a full monthly total.
-                or cash_date(event) >= date(as_of.year, as_of.month, 1)):
+                or cash_date(event) >= as_of
+                or (event.category.casefold(), event.direction, event.currency) in named_category_currencies):
             continue
         by_category_currency[(event.category, event.currency)][(cash_date(event).year, cash_date(event).month)].append(event)
     streams: list[RecurringStream] = []
@@ -174,8 +176,12 @@ def _variable_category_streams(events: list[FinancialEvent], covered: set[str], 
             streams.append(RecurringStream(
                 representative, 7, starts_on=recent_weeks[-1] + timedelta(days=7), kind="variable_category",
                 covered_event_ids=frozenset(event.event_id for event in all_events),
+                reserve_period_kind="week", reserve_period_totals=tuple(weekly_totals),
             ))
             continue
+        # Monthly fallback ignores the current partial calendar month.
+        months = {key: values for key, values in months.items()
+                  if key < (as_of.year, as_of.month)}
         if len(months) < 3:
             continue
         # Do not invent a monthly reserve from sparse/seasonal history.
@@ -189,7 +195,8 @@ def _variable_category_streams(events: list[FinancialEvent], covered: set[str], 
         representative = replace(latest, amount=_median(monthly_totals), flexibility="fixed")
         streams.append(RecurringStream(representative, 30,
                                        anchor_day=cash_date(latest).day, kind="variable_category",
-                                       covered_event_ids=frozenset(event.event_id for values in months.values() for event in values)))
+                                       covered_event_ids=frozenset(event.event_id for values in months.values() for event in values),
+                                       reserve_period_kind="month", reserve_period_totals=tuple(monthly_totals)))
     return streams
 
 
@@ -246,7 +253,13 @@ def detect_recurrences(events, as_of: date | None = None, *, include_variable_ag
     # core opts in with profile-protected categories only, which is the
     # dataset's explicit authorization to reserve essential variable spending.
     if include_variable_aggregates:
-        streams.extend(_variable_category_streams(eligible, covered_event_ids, as_of, protected_categories))
+        named_category_currencies = {
+            (stream.representative.category.casefold(), stream.representative.direction, stream.representative.currency)
+            for stream in streams if stream.kind == "named"
+        }
+        streams.extend(_variable_category_streams(
+            eligible, covered_event_ids, named_category_currencies, as_of, protected_categories,
+        ))
     aggregates = [event for event in events if event.event_type == "aggregate_stream_update" and event.recurrence_days and event.recurrence_days > 0 and event.status in {EventStatus.SCHEDULED, EventStatus.SETTLED} and event.amount is not None]
     for aggregate in aggregates:
         # Historical streams keep their history but stop forecasting once the

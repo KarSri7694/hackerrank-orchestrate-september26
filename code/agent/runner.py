@@ -42,16 +42,30 @@ class AgentRunner:
             client = self.model_client or OpenAIResponsesClient(
                 self.config, usage_tracker=self.usage_tracker, trace_writer=self.trace_writer)
             case = self.application.agent_case(request_id)
-            selection, turns, calls = self._ask(
-                client, request_id, case, DECISION_PROMPT, DECISION_SELECTION_SCHEMA, "decision")
-            chosen = self._selected(request_id, selection) or fallback
-            review_case = {"case": case, "decision_model_output": selection,
-                           "default_candidate_id": self._candidate_id(case, chosen)}
-            review, review_turns, review_calls = self._ask(
-                client, request_id, review_case, CRITIC_PROMPT, CRITIC_REVIEW_SCHEMA, "critic")
-            if isinstance(review, dict) and review.get("approved") is False:
-                chosen = self._selected(request_id, review) or chosen
-            return AgentResult(chosen, True, turns + review_turns, calls + review_calls)
+            total_turns = total_calls = 0
+            for _attempt in range(self.config.max_decision_retries + 1):
+                selection, turns, calls = self._ask(
+                    client, request_id, case, DECISION_PROMPT, DECISION_SELECTION_SCHEMA, "decision")
+                total_turns += turns
+                total_calls += calls
+                if not self._valid_selection(selection, request_id):
+                    continue
+                chosen = self._selected(request_id, selection) or fallback
+                review_case = {"case": case, "decision_model_output": selection,
+                               "default_candidate_id": self._candidate_id(case, chosen)}
+                review, review_turns, review_calls = self._ask(
+                    client, request_id, review_case, CRITIC_PROMPT, CRITIC_REVIEW_SCHEMA, "critic")
+                total_turns += review_turns
+                total_calls += review_calls
+                if not self._valid_review(review):
+                    continue
+                if review["approved"] is False:
+                    chosen = self._selected(request_id, review) or chosen
+                return AgentResult(chosen, True, total_turns, total_calls)
+            return AgentResult(
+                fallback, False, total_turns, total_calls,
+                f"malformed AI response after {self.config.max_decision_retries + 1} attempt(s)",
+            )
         except Exception as exc:
             if self.config.ai_mode == "enabled":
                 raise
@@ -117,6 +131,27 @@ class AgentRunner:
     def _selected(self, request_id, response):
         return self.application.decision_for_candidate(
             request_id, response.get("candidate_id")) if isinstance(response, dict) else None
+
+    @staticmethod
+    def _valid_selection(response, request_id: str) -> bool:
+        """Only retry a structurally malformed decision response.
+
+        A well-formed but unknown candidate remains harmless: the deterministic
+        fallback candidate is used, just as before. This prevents a model from
+        turning a bad candidate ID into an unbounded retry loop.
+        """
+        return (isinstance(response, dict)
+                and response.get("request_id") == request_id
+                and isinstance(response.get("candidate_id"), str)
+                and isinstance(response.get("explanation"), str)
+                and isinstance(response.get("evidence_used"), list))
+
+    @staticmethod
+    def _valid_review(response) -> bool:
+        return (isinstance(response, dict)
+                and isinstance(response.get("approved"), bool)
+                and isinstance(response.get("candidate_id"), str)
+                and isinstance(response.get("explanation"), str))
 
     @staticmethod
     def _candidate_id(case, decision):
