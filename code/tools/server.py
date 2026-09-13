@@ -4,6 +4,8 @@ import sys
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
+from typing_extensions import NotRequired, TypedDict
 
 from fastmcp import FastMCP
 
@@ -23,10 +25,59 @@ app = Application(_dataset_dir())
 mcp = FastMCP("buy-or-wait")
 
 
+class PaymentInput(TypedDict):
+    date: str
+    amount: str
+
+
+class SpendingChangeInput(TypedDict, total=False):
+    event_id: str
+    action: str
+    new_amount: NotRequired[str | None]
+
+
 def configure_application(application: Application) -> None:
     """Bind MCP tools to the same application state used by the agent."""
     global app
     app = application
+
+
+@mcp.tool
+def calculator(
+    operation: Literal["add", "subtract", "multiply", "divide", "percentage"],
+    left: str,
+    right: str,
+) -> dict[str, object]:
+    """Perform exact decimal arithmetic for evidence and plan reasoning.
+
+    `percentage` returns left * right / 100.  Monetary values should be
+    passed as strings to preserve cents.  This tool only calculates; it does
+    not determine affordability or select a payment plan.  Use
+    `simulate_plan` for deterministic safety verification.
+    """
+    try:
+        if operation not in {"add", "subtract", "multiply", "divide", "percentage"}:
+            return {"ok": False, "error": "unsupported_operation"}
+        lhs, rhs = Decimal(left), Decimal(right)
+        if not lhs.is_finite() or not rhs.is_finite():
+            return {"ok": False, "error": "invalid_decimal_operand"}
+        if operation == "add":
+            result = lhs + rhs
+        elif operation == "subtract":
+            result = lhs - rhs
+        elif operation == "multiply":
+            result = lhs * rhs
+        elif operation == "divide":
+            if rhs == 0:
+                return {"ok": False, "error": "division_by_zero"}
+            result = lhs / rhs
+        else:
+            result = lhs * rhs / Decimal("100")
+        if not result.is_finite():
+            return {"ok": False, "error": "invalid_decimal_result"}
+        return {"ok": True, "operation": operation, "result": format(result, "f")}
+    except (ArithmeticError, ValueError, TypeError):
+        return {"ok": False, "error": "invalid_decimal_operand"}
 
 
 @mcp.tool
@@ -36,10 +87,16 @@ def get_case(request_id: str) -> dict[str, object]:
 
 
 @mcp.tool
-def inspect_evidence(evidence_id: str) -> list[dict[str, object]]:
+def inspect_evidence(evidence_id: str) -> dict[str, object]:
     """Return structured facts from one relevant message or image."""
-    ref = app.repository.evidence(evidence_id)
+    try:
+        ref = app.repository.evidence(evidence_id)
+    except KeyError:
+        # Model-proposed references are untrusted input.  A missing reference
+        # is a normal, machine-readable rejection, not an MCP tool failure.
+        return {"evidence_id": evidence_id, "found": False, "facts": []}
     return {"evidence_id": evidence_id, "source_type": ref.source_type,
+            "found": True,
             "sent_at": ref.sent_at.isoformat() if ref.sent_at else None, "text": ref.text,
             "image_available": bool(ref.image_path), "facts": [
                 {"evidence_id": f.evidence_id, "effect": f.effect, "related_event_id": f.related_event_id,
@@ -48,12 +105,13 @@ def inspect_evidence(evidence_id: str) -> list[dict[str, object]]:
                 "status": f.status.value if f.status else None, "confidence": f.confidence,
                  "source_type": f.source_type, "sent_at": f.sent_at.isoformat() if f.sent_at else None,
                  "category": f.category, "direction": f.direction, "description": f.description,
-                 "recurring": f.recurring, "recurrence_days": f.recurrence_days}
+                 "recurring": f.recurring, "recurrence_days": f.recurrence_days,
+                 "stream_source": f.stream_source}
                 for f in app.evidence_service.inspect(evidence_id)]}
 
 
 @mcp.tool
-def simulate_plan(request_id: str, payments: list[dict[str, str]], spending_changes: list[dict[str, str | None]] | None = None) -> dict[str, object]:
+def simulate_plan(request_id: str, payments: list[PaymentInput], spending_changes: list[SpendingChangeInput] | None = None) -> dict[str, object]:
     """Prove whether a proposed dated payment plan preserves the minimum balance."""
     parsed_payments = tuple(Payment(date.fromisoformat(p["date"]), Decimal(p["amount"])) for p in payments)
     parsed_changes = tuple(SpendingChange(c["event_id"], c["action"], Decimal(c["new_amount"]) if c.get("new_amount") else None) for c in (spending_changes or []))
@@ -62,7 +120,7 @@ def simulate_plan(request_id: str, payments: list[dict[str, str]], spending_chan
 
 
 @mcp.tool
-def optimize_spending(request_id: str, payments: list[dict[str, str]]) -> dict[str, object]:
+def optimize_spending(request_id: str, payments: list[PaymentInput]) -> dict[str, object]:
     """Find legal flexible-spending changes that make a payment plan safe."""
     parsed = tuple(Payment(date.fromisoformat(p["date"]), Decimal(p["amount"])) for p in payments)
     return app.optimize_spending(request_id, parsed)

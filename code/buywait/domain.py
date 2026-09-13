@@ -168,6 +168,7 @@ class DecisionCore:
     earliest_date_for_full_payment: date | None
     spending_changes: tuple[SpendingChange, ...]
     trace: dict[str, object] = field(default_factory=dict)
+    decision_explanation: str = ""
 
 
 @dataclass(frozen=True)

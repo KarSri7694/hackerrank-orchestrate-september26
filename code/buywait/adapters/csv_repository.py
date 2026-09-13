@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -42,6 +42,49 @@ def _read(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def _assert_unique(rows: list[dict[str, str]], field: str, label: str) -> None:
+    """Fail at ingestion instead of silently replacing a duplicate row."""
+    values = [_text(row.get(field)) for row in rows]
+    if any(not value for value in values):
+        raise ValueError(f"{label} contains a blank {field}")
+    duplicates = sorted(value for value, count in Counter(values).items() if count > 1)
+    if duplicates:
+        raise ValueError(f"{label} contains duplicate {field}: {', '.join(duplicates)}")
+
+
+def _assert_event_links(events: dict[str, FinancialEvent]) -> None:
+    """Validate lifecycle links before reconciliation relies on them."""
+    for event in events.values():
+        if not event.linked_event_id:
+            continue
+        linked = events.get(event.linked_event_id)
+        if linked is None:
+            raise ValueError(
+                f"financial_events.csv event {event.event_id} references unknown linked_event_id "
+                f"{event.linked_event_id}"
+            )
+        if linked.user_id != event.user_id:
+            raise ValueError(
+                f"financial_events.csv event {event.event_id} links across users to {event.linked_event_id}"
+            )
+        if linked.event_id == event.event_id:
+            raise ValueError(f"financial_events.csv event {event.event_id} cannot link to itself")
+
+
+def _assert_evidence_event_links(rows: list[dict[str, str]], events: dict[str, FinancialEvent], label: str) -> None:
+    """Ensure evidence cannot point at an absent or unrelated ledger row."""
+    for row in rows:
+        related_event_id = _text(row.get("related_event_id"))
+        if not related_event_id:
+            continue
+        event = events.get(related_event_id)
+        if event is None:
+            raise ValueError(f"{label} references unknown related_event_id: {related_event_id}")
+        user_id = _text(row.get("user_id"))
+        if user_id and event.user_id != user_id:
+            raise ValueError(f"{label} related_event_id crosses users: {related_event_id}")
+
+
 class CsvRepository:
     def __init__(self, dataset_dir: str | Path):
         root = Path(dataset_dir)
@@ -51,6 +94,13 @@ class CsvRepository:
         options = _read(root / "request_payment_options.csv")
         messages = _read(root / "messages.csv")
         images = _read(root / "images.csv")
+
+        _assert_unique(requests, "request_id", "requests.csv")
+        _assert_unique(profiles, "user_id", "financial_profiles.csv")
+        _assert_unique(events, "event_id", "financial_events.csv")
+        _assert_unique(options, "payment_option_id", "request_payment_options.csv")
+        _assert_unique(messages, "message_id", "messages.csv")
+        _assert_unique(images, "image_id", "images.csv")
 
         self.requests = {
             r["request_id"]: FinancialRequest(
@@ -74,9 +124,14 @@ class CsvRepository:
                 max_installment_months=int(r["max_installment_months"]) if _text(r["max_installment_months"]) else None,
             ) for r in profiles
         }
+        missing_profiles = sorted({r["user_id"].strip() for r in requests if r["user_id"].strip() not in self.profiles})
+        if missing_profiles:
+            raise ValueError(f"requests.csv references missing profiles: {', '.join(missing_profiles)}")
         self.events = {}
         self.events_by_user: dict[str, list[FinancialEvent]] = defaultdict(list)
         for r in events:
+            if _text(r["user_id"]) not in self.profiles:
+                raise ValueError(f"financial_events.csv references unknown user_id: {_text(r['user_id'])}")
             event = FinancialEvent(
                 event_id=_text(r["event_id"]), user_id=_text(r["user_id"]), event_type=_text(r["event_type"]),
                 description=_text(r["description"]), category=_text(r["category"]), direction=_text(r["direction"]),
@@ -87,6 +142,7 @@ class CsvRepository:
             )
             self.events[event.event_id] = event
             self.events_by_user[event.user_id].append(event)
+        _assert_event_links(self.events)
         self.options_by_request: dict[str, list[PaymentOption]] = defaultdict(list)
         for r in options:
             option = PaymentOption(
@@ -99,13 +155,18 @@ class CsvRepository:
             self.options_by_request[option.request_id].append(option)
         self.evidence_refs: dict[str, EvidenceReference] = {}
         for r in messages:
+            if _text(r["user_id"]) not in self.profiles:
+                raise ValueError(f"messages.csv references unknown user_id: {_text(r['user_id'])}")
             ref = EvidenceReference(
                 evidence_id=_text(r["message_id"]), source_type=_text(r["source_type"]), user_id=_text(r["user_id"]),
                 request_id=_text(r["request_id"]) or None, related_event_id=_text(r["related_event_id"]) or None,
                 text=_text(r["message_text"]) or None, sent_at=_datetime(r.get("sent_at")),
             )
             self.evidence_refs[ref.evidence_id] = ref
+        _assert_evidence_event_links(messages, self.events, "messages.csv")
         for r in images:
+            if _text(r["user_id"]) not in self.profiles:
+                raise ValueError(f"images.csv references unknown user_id: {_text(r['user_id'])}")
             image_path = root / "media" / "images" / f"{_text(r['image_id'])}.png"
             ref = EvidenceReference(
                 evidence_id=_text(r["image_id"]), source_type="image", user_id=_text(r["user_id"]),
@@ -113,6 +174,7 @@ class CsvRepository:
                 image_path=str(image_path),
             )
             self.evidence_refs[ref.evidence_id] = ref
+        _assert_evidence_event_links(images, self.events, "images.csv")
         self.evidence_by_user: dict[str, list[EvidenceReference]] = defaultdict(list)
         for ref in self.evidence_refs.values():
             self.evidence_by_user[ref.user_id].append(ref)
@@ -122,7 +184,21 @@ class CsvRepository:
             raise KeyError(f"unknown request_id: {request_id}")
         request = self.requests[request_id]
         profile = self.profiles[request.user_id]
-        refs = tuple(r for r in self.evidence_by_user[request.user_id] if r.request_id in {None, request_id} or r.related_event_id in {e.event_id for e in self.events_by_user[request.user_id]})
+        event_ids = {event.event_id for event in self.events_by_user[request.user_id]}
+        # Evidence is known only once it has been sent.  Requests are
+        # date-granular, so a message on the request date is admissible.
+        candidates = [
+            ref for ref in self.evidence_by_user[request.user_id]
+            if (ref.sent_at is None or ref.sent_at.date() <= request.request_date)
+            and (ref.request_id in {None, request_id} or ref.related_event_id in event_ids)
+        ]
+        def relevance(ref: EvidenceReference):
+            # Request-specific evidence is strongest, then evidence tied to a
+            # financial event, then broad user-level stream evidence.
+            tier = 0 if ref.request_id == request_id else 1 if ref.related_event_id in event_ids else 2
+            sent = ref.sent_at or datetime.min
+            return (tier, -sent.toordinal() if hasattr(sent, "toordinal") else 0, ref.evidence_id)
+        refs = tuple(sorted(candidates, key=relevance))
         return RequestContext(request, profile, tuple(self.events_by_user[request.user_id]), tuple(self.options_by_request[request_id]), refs)
 
     def event(self, event_id: str) -> FinancialEvent:

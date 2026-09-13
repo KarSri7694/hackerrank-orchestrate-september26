@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
+import re
 
 from .adapters.csv_repository import CsvRepository
 from .adapters.evidence_cache import JsonEvidenceCache
 from .adapters.exchange_rates import CsvExchangeRates
-from .core import _optimized_changes, baseline, simulate, solve, validate_changes
+from .core import _optimized_changes, baseline, expand_option, simulate, solve, validate_changes
 from .domain import CorrectionEvaluation, EvidenceFact, EventStatus, Payment, SpendingChange
 from .evidence import EvidenceService
+from .presentation import decision_explanation
 from .reconciliation import _fact_stream_key, _unique_transfer_pair, reconcile_context
+from .recurrence import detect_recurrences, event_stream_key
 
 
 class Application:
@@ -21,12 +24,112 @@ class Application:
         self.repository = CsvRepository(dataset_dir)
         self.fx = CsvExchangeRates(Path(dataset_dir) / "exchange_rates.csv")
         cache_path = Path(evidence_cache_path) if evidence_cache_path else Path(dataset_dir) / ".evidence_cache.json"
-        self.evidence_service = EvidenceService(self.repository, evidence_extractor, JsonEvidenceCache(cache_path))
+        self.evidence_service = EvidenceService(
+            self.repository, evidence_extractor, JsonEvidenceCache(cache_path),
+            stream_context_provider=self._stream_context_for_evidence,
+        )
+
+    def _stream_context_for_evidence(self, reference):
+        """Give the extractor a small ledger view rather than the whole CSV."""
+        events = self.repository.events_by_user.get(reference.user_id, ())
+        related = self.repository.events.get(reference.related_event_id or "")
+        selected = []
+        if related:
+            selected.append(related)
+            selected.extend(event for event in events if event.event_id != related.event_id
+                            and event_stream_key(event) == event_stream_key(related))
+        else:
+            words = {word.casefold() for word in (reference.text or "").replace("/", " ").split() if len(word) > 2}
+            selected = [event for event in events if words & {word.casefold() for word in event.description.replace("/", " ").split()}]
+            if not selected:
+                selected = sorted(events, key=lambda event: event.settlement_date or event.event_date, reverse=True)[:12]
+        selected = sorted(selected, key=lambda event: event.settlement_date or event.event_date, reverse=True)[:12]
+        return tuple(self._event_payload(event) for event in selected)
 
     def _context(self, request_id: str):
         raw = self.repository.context(request_id)
-        facts = self.evidence_service.facts_for(raw.evidence_refs)
+        facts = self._validated_facts(raw, self.evidence_service.facts_for(raw.evidence_refs, request_id=request_id))
         return self._reconciled(raw, facts)
+
+    def _validated_facts(self, raw, facts):
+        """Reject malformed extractor facts before reconciliation can use them.
+
+        This is deliberately deterministic: model confidence is not authority.
+        Critic corrections receive the stricter evidence-support checks in
+        ``evaluate_correction`` as well.
+        """
+        refs = {ref.evidence_id: ref for ref in raw.evidence_refs}
+        events = {event.event_id: event for event in raw.events}
+        currencies = {raw.profile.home_currency} | {event.currency for event in raw.events if event.currency}
+        # A stream explicitly introduced by evidence may have no historical
+        # event in its currency yet. Admit only currencies represented by the
+        # fixed offline exchange-rate table; simulation will still enforce
+        # that a usable dated conversion exists.
+        rates = getattr(getattr(self, "fx", None), "rates", {})
+        for rate_key in rates:
+            if isinstance(rate_key, tuple) and len(rate_key) >= 3:
+                currencies.update(rate_key[1:3])
+        effects = {"cancel", "amend", "amount_amendment", "date_amendment", "delay", "settle",
+                   "image_amount", "stream_update", "aggregate_stream_update", "terminate",
+                   "internal_transfer", "one_time"}
+        accepted = []
+        for fact in facts:
+            ref = refs.get(fact.evidence_id)
+            # A missing image is not evidence.  Do not let a stale cache entry
+            # or a model response produced without the image mutate the ledger.
+            if (ref is not None and ref.source_type == "image"
+                    and (not ref.image_path or not Path(ref.image_path).is_file())):
+                continue
+            # Older persistent extraction caches can contain a model
+            # placeholder amount. Re-apply this safety boundary when loading
+            # a legacy cache, before any fact can reach reconciliation.
+            if (ref is not None and ref.text and fact.amount == Decimal("0")
+                    and not re.search(r"(?<![A-Za-z0-9])0(?![A-Za-z0-9])", ref.text)):
+                continue
+            if ref is None or fact.effect not in effects:
+                continue
+            if (fact.amount is not None
+                    and (not fact.amount.is_finite() or fact.amount < 0)):
+                continue
+            if (fact.minimum_allowed_amount is not None
+                    and (not fact.minimum_allowed_amount.is_finite() or fact.minimum_allowed_amount < 0)):
+                continue
+            if fact.currency and fact.currency not in currencies:
+                continue
+            if fact.direction and fact.direction not in {"credit", "debit"}:
+                continue
+            event = events.get(fact.related_event_id or "")
+            if fact.related_event_id and event is None:
+                continue
+            if (ref.source_type == "image" and event is not None and event.amount is None
+                    and fact.amount is not None and fact.currency):
+                fact = replace(fact, effect="image_amount")
+            if event is not None:
+                if fact.direction and fact.direction != event.direction:
+                    continue
+                if fact.category and fact.category != event.category:
+                    continue
+                if fact.effect == "image_amount" and (ref.source_type != "image" or ref.related_event_id != event.event_id or event.amount is not None):
+                    continue
+            if fact.effect == "internal_transfer" and not fact.related_event_id and _unique_transfer_pair(list(raw.events), fact) is None:
+                continue
+            stream_level = fact.related_event_id is None and fact.effect != "internal_transfer"
+            pending_stream_status = fact.effect == "stream_update" and fact.status == EventStatus.PENDING
+            if stream_level and not (fact.category and fact.direction
+                                     and (fact.effective_date or pending_stream_status)):
+                continue
+            if fact.recurrence_days is not None and fact.recurrence_days <= 0:
+                continue
+            if fact.recurring is False and fact.recurrence_days is not None:
+                continue
+            if fact.effect == "aggregate_stream_update" and not (fact.amount is not None and fact.currency and fact.recurring is True and fact.recurrence_days):
+                continue
+            if fact.effect == "stream_update" and fact.recurring is True and not fact.recurrence_days:
+                continue
+            if fact.effect == "terminate" and stream_level and not _fact_stream_key(fact):
+                continue
+            accepted.append(fact)
+        return tuple(accepted)
 
     @staticmethod
     def _reconciled(raw, facts):
@@ -64,8 +167,16 @@ class Application:
                 return CorrectionEvaluation(False, "fact is not tied to supplied evidence", baseline_decision)
             if fact.effect not in allowed_effects:
                 return CorrectionEvaluation(False, "unsupported correction effect", baseline_decision)
-            if fact.amount is not None and fact.amount < 0:
+            if (fact.amount is not None
+                    and (not fact.amount.is_finite() or fact.amount < 0)):
                 return CorrectionEvaluation(False, "negative correction amount", baseline_decision)
+            if (fact.minimum_allowed_amount is not None
+                    and (not fact.minimum_allowed_amount.is_finite() or fact.minimum_allowed_amount < 0)):
+                return CorrectionEvaluation(False, "invalid minimum correction amount", baseline_decision)
+            if fact.recurrence_days is not None and fact.recurrence_days <= 0:
+                return CorrectionEvaluation(False, "invalid recurrence cadence", baseline_decision)
+            if fact.recurring is False and fact.recurrence_days is not None:
+                return CorrectionEvaluation(False, "one-time correction cannot have recurrence cadence", baseline_decision)
             if fact.related_event_id and fact.related_event_id not in event_ids:
                 return CorrectionEvaluation(False, "correction references an unknown event", baseline_decision)
             if fact.effect == "internal_transfer" and not fact.related_event_id:
@@ -83,7 +194,7 @@ class Application:
                 return CorrectionEvaluation(False, "invalid event status", baseline_decision)
             if not self._fact_is_supported(raw, fact):
                 return CorrectionEvaluation(False, "correction cannot be verified from supplied evidence", baseline_decision)
-        base_facts = self.evidence_service.facts_for(raw.evidence_refs)
+        base_facts = self._validated_facts(raw, self.evidence_service.facts_for(raw.evidence_refs))
         candidate_context = self._reconciled(raw, base_facts + tuple(facts))
         candidate = solve(candidate_context, self.fx)
         if candidate.payment_plan and not simulate(candidate_context, self.fx, candidate.payment_plan, candidate.spending_changes).safe:
@@ -143,9 +254,33 @@ class Application:
     def decision(self, request_id: str):
         return solve(self._context(request_id), self.fx)
 
-    def case(self, request_id: str) -> dict[str, object]:
+    def finalized_decision(self, request_id: str, decision=None):
+        """Attach the submission explanation from the same reconciled state used to solve."""
         ctx = self._context(request_id)
+        decision = decision or solve(ctx, self.fx)
+        simulation = simulate(ctx, self.fx, decision.payment_plan, decision.spending_changes)
+        financing_fee = None
+        if decision.recommended_payment_method.value == "installments":
+            for option in ctx.payment_options:
+                if tuple((p.date, p.amount) for p in expand_option(option)) == tuple((p.date, p.amount) for p in decision.payment_plan):
+                    financing_fee = option.financing_fee
+                    break
+        explanation = decision_explanation(
+            decision, currency=ctx.profile.home_currency,
+            minimum_balance=ctx.profile.minimum_balance_to_keep,
+            projected_minimum=simulation.minimum_projected_balance if decision.payment_plan else None,
+            financing_fee=financing_fee,
+        )
+        return replace(decision, decision_explanation=explanation)
+
+    def case(self, request_id: str) -> dict[str, object]:
+        raw = self.repository.context(request_id)
+        facts = self._validated_facts(raw, self.evidence_service.facts_for(raw.evidence_refs, request_id=request_id))
+        ctx = self._reconciled(raw, facts)
         safe, earliest = baseline(ctx, self.fx)
+        selected = solve(ctx, self.fx)
+        baseline_result = simulate(ctx, self.fx)
+        selected_result = simulate(ctx, self.fx, selected.payment_plan, selected.spending_changes)
         return {
             "request_id": ctx.request.request_id,
             "user_id": ctx.request.user_id,
@@ -173,6 +308,24 @@ class Application:
                 "financing_fee": str(o.financing_fee),
                 "total_payable_amount": str(o.total_payable_amount),
             } for o in ctx.payment_options],
+            "raw_financial_events": [self._event_payload(event) for event in self._compact_events(raw.events, raw.request.request_date)],
+            "resolved_financial_events": [self._event_payload(event) for event in self._compact_events(ctx.events, ctx.request.request_date)],
+            "resolved_recurring_streams": [self._stream_payload(stream) for stream in detect_recurrences(ctx.events)],
+            "extracted_evidence": [{
+                "evidence_id": ref.evidence_id, "source_type": ref.source_type,
+                "related_event_id": ref.related_event_id,
+                "sent_at": ref.sent_at.isoformat() if ref.sent_at else None,
+                "facts": [self._fact_payload(fact) for fact in facts if fact.evidence_id == ref.evidence_id],
+            } for ref in ctx.evidence_refs],
+            "forecast_diagnostics": {
+                "amount_safe_to_pay": str(safe),
+                "earliest_date_for_full_payment": earliest.isoformat() if earliest else None,
+                "required_minimum_balance": str(ctx.profile.minimum_balance_to_keep),
+                "baseline_minimum_projected_balance": str(baseline_result.minimum_projected_balance),
+                "recommended_plan_minimum_projected_balance": str(selected_result.minimum_projected_balance),
+                "recommended_plan_ending_balance": str(selected_result.ending_balance),
+                "first_violation_date": selected_result.first_violation_date.isoformat() if selected_result.first_violation_date else None,
+            },
             "evidence_refs": [{
                 "evidence_id": r.evidence_id, "source_type": r.source_type,
                 "request_id": r.request_id, "related_event_id": r.related_event_id,
@@ -180,6 +333,75 @@ class Application:
                 "has_text": bool(r.text), "image_available": bool(r.image_path),
             } for r in ctx.evidence_refs],
         }
+
+    @staticmethod
+    def _event_payload(event):
+        return {
+            "event_id": event.event_id, "event_type": event.event_type,
+            "description": event.description, "category": event.category,
+            "direction": event.direction, "amount": str(event.amount) if event.amount is not None else None,
+            "currency": event.currency, "event_date": event.event_date.isoformat(),
+            "settlement_date": event.settlement_date.isoformat() if event.settlement_date else None,
+            "status": event.status.value, "linked_event_id": event.linked_event_id,
+            "flexibility": event.flexibility,
+            "minimum_allowed_amount": str(event.minimum_allowed_amount) if event.minimum_allowed_amount is not None else None,
+            "recurrence_days": event.recurrence_days,
+        }
+
+    @staticmethod
+    def _fact_payload(fact):
+        return {
+            "effect": fact.effect, "related_event_id": fact.related_event_id,
+            "amount": str(fact.amount) if fact.amount is not None else None,
+            "currency": fact.currency,
+            "effective_date": fact.effective_date.isoformat() if fact.effective_date else None,
+            "status": fact.status.value if fact.status else None,
+            "category": fact.category, "direction": fact.direction,
+            "description": fact.description, "recurring": fact.recurring,
+            "recurrence_days": fact.recurrence_days, "stream_source": fact.stream_source,
+        }
+
+    @staticmethod
+    def _stream_payload(stream):
+        event = stream.representative
+        return {
+            "description": event.description,
+            "category": event.category,
+            "direction": event.direction,
+            "amount": str(event.amount) if event.amount is not None else None,
+            "currency": event.currency,
+            "cadence_days": stream.cadence_days,
+            "starts_on": stream.starts_on.isoformat() if stream.starts_on else None,
+            "ends_before": stream.ends_before.isoformat() if stream.ends_before else None,
+        }
+
+    @staticmethod
+    def _compact_events(events, request_date: date):
+        """Keep forecast rows plus enough per-stream history to audit recurrence."""
+        lower, upper = request_date - timedelta(days=120), request_date + timedelta(days=89)
+        selected = {event.event_id for event in events if request_date <= (event.settlement_date or event.event_date) <= upper}
+        history_by_stream: dict[tuple[str, str, str, str], list] = {}
+        for event in sorted(events, key=lambda item: item.settlement_date or item.event_date, reverse=True):
+            day = event.settlement_date or event.event_date
+            if not lower <= day < request_date:
+                continue
+            key = (event.description, event.category, event.direction, event.currency)
+            bucket = history_by_stream.setdefault(key, [])
+            if len(bucket) < 3:
+                bucket.append(event)
+                selected.add(event.event_id)
+        changed = True
+        while changed:
+            changed = False
+            for event in events:
+                if event.event_id in selected or event.linked_event_id in selected:
+                    if event.event_id not in selected:
+                        selected.add(event.event_id)
+                        changed = True
+                    if event.linked_event_id and event.linked_event_id not in selected:
+                        selected.add(event.linked_event_id)
+                        changed = True
+        return tuple(event for event in events if event.event_id in selected)
 
     def simulate_plan(self, request_id: str, payments: tuple[Payment, ...], changes: tuple[SpendingChange, ...] = ()):
         ctx = self._context(request_id)
@@ -190,7 +412,11 @@ class Application:
         ctx = self._context(request_id)
         changes = _optimized_changes(ctx, self.fx, payments)
         result = simulate(ctx, self.fx, payments, tuple(changes or ()))
-        return {"possible": bool(changes is not None and result.safe), "spending_changes": [c.__dict__ for c in changes or ()], "minimum_projected_balance": str(result.minimum_projected_balance)}
+        return {"possible": bool(changes is not None and result.safe), "spending_changes": [
+            {"event_id": change.event_id, "action": change.action,
+             "new_amount": str(change.new_amount) if change.new_amount is not None else None}
+            for change in changes or ()
+        ], "minimum_projected_balance": str(result.minimum_projected_balance)}
 
     def _validate_changes(self, ctx, changes: tuple[SpendingChange, ...]):
         validate_changes(ctx, changes)

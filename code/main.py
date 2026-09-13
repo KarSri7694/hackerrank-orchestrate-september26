@@ -1,39 +1,59 @@
 from __future__ import annotations
 
-import json
+import argparse
+import os
 from pathlib import Path
 from agent.config import AgentConfig
+from agent.usage import UsageTracker
 
 from buywait.application import Application
+from buywait.output import write_output
+from evaluation.output_validation import validate_output
 
 
 def main() -> None:
-    """Run the deterministic solver and print structured decisions for manual export."""
+    """Generate and validate a submission-ready Buy or Wait output.csv."""
+    parser = argparse.ArgumentParser(description="Generate Buy or Wait submission output")
+    parser.add_argument("--output", type=Path, default=None, help="CSV destination (default: repository-root output.csv)")
+    parser.add_argument("--require-ai", action="store_true", help="fail instead of silently omitting AI evidence extraction")
+    parser.add_argument("--no-ai", action="store_true", help="deterministic-only mode for debugging and tests")
+    args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
+    output_path = args.output or root / "output.csv"
     config = AgentConfig.from_dotenv(root / ".env")
+    usage = UsageTracker(config.base_url, config.input_cost_per_million, config.output_cost_per_million)
     extractor = None
-    if config.ai_mode != "disabled" and config.api_key:
+    ai_available = config.ai_mode != "disabled" and bool(config.api_key)
+    if args.require_ai and (args.no_ai or not ai_available):
+        raise SystemExit("--require-ai needs configured AI_MODE and OPENAI_API_KEY in .env")
+    if ai_available and not args.no_ai:
         from agent.evidence_extractor import OpenAIEvidenceExtractor
-        extractor = OpenAIEvidenceExtractor(config)
+        extractor = OpenAIEvidenceExtractor(config, usage_tracker=usage)
     app = Application(root / "dataset", evidence_extractor=extractor)
+    if args.require_ai and not config.vision_enabled and any(
+            ref.source_type == "image" for ref in app.repository.evidence_refs.values()):
+        raise SystemExit("--require-ai needs OPENAI_VISION_ENABLED=true because the dataset contains image evidence")
     runner = None
-    if config.ai_mode != "disabled":
+    if extractor is not None:
         from tools import server
         from agent.runner import AgentRunner
         server.configure_application(app)
-        runner = AgentRunner(app, server.mcp, root / "dataset", config=config)
-    for request_id in app.repository.request_ids():
-        decision = (runner.run(request_id).decision if runner else app.decision(request_id))
-        print(json.dumps({
-            "request_id": decision.request_id,
-            "amount_safe_to_pay": str(decision.amount_safe_to_pay),
-            "affordability_status": decision.affordability_status.value,
-            "recommended_payment_method": decision.recommended_payment_method.value,
-            "payment_plan": [{"date": p.date.isoformat(), "amount": str(p.amount)} for p in decision.payment_plan],
-            "earliest_date_for_full_payment": decision.earliest_date_for_full_payment.isoformat() if decision.earliest_date_for_full_payment else None,
-            "spending_changes": [c.__dict__ for c in decision.spending_changes],
-            "trace": decision.trace,
-        }, separators=(",", ":")))
+        runner = AgentRunner(app, server.mcp, root / "dataset", config=config, usage_tracker=usage)
+    decisions = []
+    request_ids = app.repository.request_ids()
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    for index, request_id in enumerate(request_ids, 1):
+        decision = runner.run(request_id).decision if runner else app.decision(request_id)
+        decisions.append(app.finalized_decision(request_id, decision))
+        # Publish each completed row immediately for live inspection. The
+        # final validated result is still atomically replaced below.
+        write_output(output_path, decisions)
+        print(f"[{index}/{len(request_ids)}] processed {request_id}", flush=True)
+    write_output(temporary_path, decisions)
+    validate_output(temporary_path, app)
+    os.replace(temporary_path, output_path)
+    usage.report(root / "code" / "evaluation" / "usage_report.md", len(decisions), app.evidence_service.cache_hits)
+    print(f"wrote and validated {len(decisions)} rows to {output_path}")
 
 
 if __name__ == "__main__":

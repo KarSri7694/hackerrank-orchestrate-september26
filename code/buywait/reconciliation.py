@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
+import re
 
 from .domain import EventStatus, EvidenceFact, FinancialEvent
-from .recurrence import event_stream_key, stream_key
+from .recurrence import cash_date, detect_recurrences, event_stream_key, stream_key
 
 _AMENDMENT_EFFECTS = {"amend", "amendment", "amount_amendment", "date_amendment", "delay", "delayed", "confirm", "confirmed", "add_fact", "settle", "settled", "image_amount", "stream_update", "aggregate_stream_update"}
 _CANCELLATION_EFFECTS = {"cancel", "cancelled", "cancellation", "terminate", "terminated"}
@@ -63,21 +64,75 @@ def _apply_event_facts(event: FinancialEvent, related: list[tuple[int, EvidenceF
 
 
 def _stream_event(fact: EvidenceFact, user_id: str, position: int) -> FinancialEvent | None:
-    if not fact.category or not fact.direction or not fact.effective_date:
+    if not fact.category or not fact.direction:
+        return None
+    effective_date = fact.effective_date or (fact.sent_at.date() if fact.sent_at else None)
+    if not effective_date:
         return None
     terminal = fact.effect in _CANCELLATION_EFFECTS
     return FinancialEvent(
         event_id=f"evidence:{fact.evidence_id}:{position}", user_id=user_id,
-        event_type="aggregate_stream_update" if fact.effect == "aggregate_stream_update" else ("income" if fact.direction == "credit" else "expense"),
+        event_type=("aggregate_stream_update" if fact.effect == "aggregate_stream_update"
+                    else "stream_status" if fact.status == EventStatus.PENDING and fact.amount is None
+                    else ("income" if fact.direction == "credit" else "expense")),
         description=fact.stream_source or fact.description or ("Terminal stream evidence" if terminal else "Evidence stream update"),
         category=fact.category, direction=fact.direction, amount=fact.amount,
-        currency=fact.currency or "", event_date=fact.effective_date,
-        settlement_date=fact.effective_date if fact.status == EventStatus.SETTLED else None,
+        currency=fact.currency or "", event_date=effective_date,
+        settlement_date=effective_date if fact.status == EventStatus.SETTLED else None,
         status=EventStatus.CANCELLED if terminal else (fact.status or EventStatus.SCHEDULED),
         linked_event_id=None, flexibility=fact.flexibility or "fixed",
         minimum_allowed_amount=fact.minimum_allowed_amount,
-        recurrence_days=0 if fact.recurring is False else fact.recurrence_days,
+        # An omitted recurrence flag is not permission to forecast a stream.
+        # Only an explicitly recurring fact with a positive cadence may seed
+        # future occurrences; one-time and incomplete evidence stay one-time.
+        recurrence_days=(fact.recurrence_days if fact.recurring is True and fact.recurrence_days and fact.recurrence_days > 0 else 0),
     )
+
+
+def _stream_update_fact(events: list[FinancialEvent], fact: EvidenceFact) -> EvidenceFact:
+    """Complete an update from an unambiguous existing recurring stream.
+
+    A stream-level message commonly gives the new amount and effective date,
+    but not the word ``monthly`` in the model's structured response.  It is
+    still an update to an already evidenced recurring stream, not a new
+    one-time cash flow.  We may inherit cadence/source only when the source
+    maps to exactly one detected stream; category-wide guessing is forbidden.
+    """
+    # An omitted recurrence flag is common in otherwise valid model output.
+    # If the update maps to exactly one historical recurring stream, inherit
+    # that stream's cadence.  An explicit false remains authoritative: it is
+    # allowed to describe a one-time adjustment and must not create a
+    # forecast.
+    if fact.effect != "stream_update" or fact.recurring is False:
+        return fact
+    streams = list(detect_recurrences(tuple(events)))
+    candidates = [stream for stream in streams
+                  if stream.representative.category == fact.category
+                  and stream.representative.direction == fact.direction]
+    if fact.stream_source:
+        source_key = stream_key(fact.category or "", fact.direction or "", fact.stream_source)
+        exact = [stream for stream in candidates
+                 if event_stream_key(stream.representative) == source_key]
+        if exact:
+            candidates = exact
+        else:
+            # A semantic source can use the employer/service name while the
+            # ledger description is generic. Token overlap is a safe bridge;
+            # otherwise only a single category/direction stream is eligible.
+            def words(value):
+                return {word for word in re.sub(r"[^a-z0-9]+", " ", value.casefold()).split()
+                        if len(word) > 2}
+            named = words(fact.stream_source)
+            overlap = [stream for stream in candidates
+                       if named & words(stream.representative.description)]
+            candidates = overlap or candidates if len(candidates) == 1 or overlap else []
+    if len(candidates) != 1:
+        return fact
+    stream = candidates[0]
+    return replace(fact,
+                   stream_source=stream.representative.description,
+                   recurring=True,
+                   recurrence_days=fact.recurrence_days or stream.cadence_days)
 
 
 def _deduplicate_lifecycles(events: list[FinancialEvent]) -> tuple[FinancialEvent, ...]:
@@ -199,12 +254,13 @@ def reconcile_events(events, facts) -> tuple[FinancialEvent, ...]:
         fact_key = _fact_stream_key(fact)
         if not fact.category or not fact.direction or not fact_key:
             continue
-        resolved = [replace(event, status=EventStatus.CANCELLED)
+        resolved = [replace(event, status=EventStatus.CANCELLED, event_type="stream_status")
                     if event_stream_key(event) == fact_key
                     else event for event in resolved]
     user_id = resolved[0].user_id if resolved else ""
     for position, fact in enumerate(facts):
         if fact.related_event_id is None:
+            fact = _stream_update_fact(resolved, fact)
             stream = _stream_event(fact, user_id, position)
             if stream:
                 resolved.append(stream)

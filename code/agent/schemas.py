@@ -70,3 +70,47 @@ def response_function_calls(response):
         if getattr(item, "type", None) == "function_call":
             calls.append({"name": item.name, "call_id": item.call_id, "arguments": item.arguments})
     return calls
+
+
+def response_text(response) -> str:
+    """Read final text from Responses SDK and OpenAI-compatible response shapes."""
+    direct = getattr(response, "output_text", None)
+    if direct:
+        return str(direct)
+    choices = getattr(response, "choices", None) or []
+    if choices:
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None)
+        if content:
+            return str(content)
+        reasoning = getattr(message, "reasoning_content", None)
+        if reasoning:
+            return str(reasoning)
+    pieces = []
+    for item in getattr(response, "output", []) or []:
+        for content in getattr(item, "content", []) or []:
+            if getattr(content, "type", None) in {"output_text", "text"} and getattr(content, "text", None):
+                pieces.append(str(content.text))
+        if getattr(item, "type", None) in {"output_text", "text"} and getattr(item, "text", None):
+            pieces.append(str(item.text))
+    return "\n".join(pieces)
+
+
+def parse_json_object(raw: str) -> dict | None:
+    """Extract a JSON object after optional thinking/fence text."""
+    decoder = json.JSONDecoder()
+    found = None
+    found_rank = (-1, -1)
+    for index, character in enumerate(raw or ""):
+        if character != "{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(raw[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            signature = 1 if {"agree", "correction", "facts"} & candidate.keys() else 0
+            rank = (signature, len(raw[index:]))
+            if rank > found_rank:
+                found, found_rank = candidate, rank
+    return found

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import argparse
 import sys
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -156,7 +158,7 @@ def _field_category(field: str, expected: str, actual: str) -> str:
     return "PLAN_RANKING"
 
 
-def evaluate_samples(dataset_dir: str | Path, evidence_extractor=None) -> tuple[SampleResult, ...]:
+def evaluate_samples(dataset_dir: str | Path, evidence_extractor=None, progress=None, decision_provider=None) -> tuple[SampleResult, ...]:
     dataset_dir = Path(dataset_dir)
     app = Application(dataset_dir, evidence_extractor=evidence_extractor)
     with (dataset_dir / "sample_requests.csv").open(newline="", encoding="utf-8-sig") as handle:
@@ -177,12 +179,34 @@ def evaluate_samples(dataset_dir: str | Path, evidence_extractor=None) -> tuple[
         request_id = row["request_id"]
         try:
             expected = _expected_values(row)
-            actual = _actual_values(app.decision(request_id))
+            decision = decision_provider(app, request_id) if decision_provider else app.decision(request_id)
+            decision = app.finalized_decision(request_id, decision)
+            actual = _actual_values(decision)
             diffs = tuple(FieldDiff(field, _display(field, expected[field]), _display(field, actual[field]), _field_category(field, _display(field, expected[field]), _display(field, actual[field]))) for field in FIELDS if not _equal(field, expected[field], actual[field]))
-            results.append(SampleResult(request_id, diffs))
+            if not decision.decision_explanation.strip():
+                diffs += (FieldDiff("decision_explanation", "non-empty", "", "EXPLANATION"),)
+            result = SampleResult(request_id, diffs)
+            results.append(result)
         except Exception as exc:
-            results.append(SampleResult(request_id, error=f"{type(exc).__name__}: {exc}"))
+            result = SampleResult(request_id, error=f"{type(exc).__name__}: {exc}")
+            results.append(result)
+        if progress:
+            progress(result, len(results), len(rows))
     return tuple(results)
+
+
+def print_progress(result: SampleResult, index: int, total: int) -> None:
+    """Emit a completed row immediately so long local-model runs are inspectable."""
+    if result.error:
+        print(f"[{index}/{total}] {result.request_id} ERROR {result.error}", flush=True)
+        return
+    if result.passed:
+        print(f"[{index}/{total}] {result.request_id} PASS", flush=True)
+        return
+    fields = ",".join(diff.field for diff in result.diffs)
+    print(f"[{index}/{total}] {result.request_id} FAIL fields={fields}", flush=True)
+    for diff in result.diffs:
+        print(f"  {diff.field}: expected={diff.expected!r} actual={diff.actual!r} category={diff.category}", flush=True)
 
 
 def print_report(results: tuple[SampleResult, ...]) -> None:
@@ -230,14 +254,31 @@ def print_report(results: tuple[SampleResult, ...]) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the public sample regression evaluator")
+    parser.add_argument("--no-ai", action="store_true", help="run deterministic evaluation without evidence extraction")
+    parser.add_argument("--require-ai", action="store_true", help="fail if the configured AI provider is unavailable")
+    parser.add_argument("--trace-path", default=str(Path("evaluation") / "model_turns.jsonl"),
+                        help="JSONL file receiving every model turn (default: evaluation/model_turns.jsonl)")
+    args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     extractor = None
     from agent.config import AgentConfig
     config = AgentConfig.from_dotenv(root / ".env")
-    if config.ai_mode != "disabled" and config.api_key:
+    if args.require_ai and (args.no_ai or config.ai_mode == "disabled" or not config.api_key):
+        raise SystemExit("--require-ai needs configured AI_MODE and OPENAI_API_KEY in .env")
+    if not args.no_ai and config.ai_mode != "disabled" and config.api_key:
         from agent.evidence_extractor import OpenAIEvidenceExtractor
-        extractor = OpenAIEvidenceExtractor(config)
-    print_report(evaluate_samples(root / "dataset", evidence_extractor=extractor))
+        from agent.trace import ModelTurnRecorder
+        recorder = ModelTurnRecorder(root / args.trace_path,
+                                     run_id=datetime.now(timezone.utc).isoformat())
+        extractor = OpenAIEvidenceExtractor(config, trace_writer=recorder)
+    else:
+        recorder = None
+    try:
+        print_report(evaluate_samples(root / "dataset", evidence_extractor=extractor, progress=print_progress))
+    finally:
+        if recorder is not None:
+            recorder.close()
 
 
 if __name__ == "__main__":

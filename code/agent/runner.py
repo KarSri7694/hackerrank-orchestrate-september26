@@ -13,7 +13,7 @@ from .config import AgentConfig
 from .mcp_bridge import MCPToolBridge
 from .openai_client import OpenAIResponsesClient
 from .prompts import SYSTEM_PROMPT
-from .schemas import CRITIQUE_SCHEMA, response_function_calls, response_output_items
+from .schemas import CRITIQUE_SCHEMA, parse_json_object, response_function_calls, response_output_items, response_text
 
 
 @dataclass
@@ -27,8 +27,9 @@ class AgentResult:
 
 class AgentRunner:
     def __init__(self, application, mcp_server, dataset_dir: str | Path,
-                 model_client=None, max_turns: int = 4, max_tool_calls: int = 8,
-                 max_evidence_calls: int = 4, config: AgentConfig | None = None):
+                 model_client=None, max_turns: int = 2, max_tool_calls: int = 8,
+                 max_evidence_calls: int = 4, config: AgentConfig | None = None, usage_tracker=None,
+                 trace_writer=None):
         self.application = application
         self.bridge = MCPToolBridge(mcp_server, Path(dataset_dir) / "media" / "images")
         self.dataset_dir = Path(dataset_dir)
@@ -38,13 +39,16 @@ class AgentRunner:
         self.max_tool_calls = min(max_tool_calls, self.config.max_tool_calls, 12)
         self.max_evidence_calls = min(max_evidence_calls, self.config.max_evidence_calls, 8)
         self.max_critique_rounds = min(self.config.max_critique_rounds, 2)
+        self.usage_tracker = usage_tracker
+        self.trace_writer = trace_writer
 
     def run(self, request_id: str) -> AgentResult:
         mode = self.config.ai_mode
         if mode == "disabled" or (mode == "auto" and not self.config.api_key):
             return self._fallback(request_id, "AI disabled or OPENAI_API_KEY missing", 0, 0)
         try:
-            client = self.model_client or OpenAIResponsesClient(self.config)
+            client = self.model_client or OpenAIResponsesClient(self.config, usage_tracker=self.usage_tracker,
+                                                                 trace_writer=self.trace_writer)
             return self._loop(request_id, client)
         except Exception as exc:
             if mode == "enabled":
@@ -59,9 +63,15 @@ class AgentRunner:
         model sees the resulting decision only in a later critique round.
         """
         decision = self.application.decision(request_id)
+        # There is nothing for the critic to inspect when the request has no
+        # attached message/image.  Preserve the deterministic result and avoid
+        # spending a local-model turn inventing evidence references.
+        context_getter = getattr(self.application, "_context", None)
+        if context_getter is not None and not context_getter(request_id).evidence_refs:
+            return self._with_trace(decision, "no_attached_evidence", 0, 0)
         total_tools = 0
         for round_number in range(self.max_critique_rounds):
-            payload, turns, tool_calls = self._critique(request_id, decision, client)
+            payload, turns, tool_calls = self._critique(request_id, decision, client, round_number)
             total_tools += tool_calls
             if payload is None:
                 break
@@ -82,7 +92,7 @@ class AgentRunner:
             decision = updated
         return self._with_trace(decision, "critique_round_limit_reached", self.max_critique_rounds, total_tools)
 
-    def _critique(self, request_id: str, decision: DecisionCore, client):
+    def _critique(self, request_id: str, decision: DecisionCore, client, round_number: int = 0):
         tools = self.bridge.openai_tools()
         case = self.application.case(request_id)
         history: list[dict] = [{"role": "user", "content": [{"type": "input_text", "text": json.dumps({
@@ -95,20 +105,28 @@ class AgentRunner:
         evidence_count = 0
         seen_images: set[str] = set()
         for turn in range(self.max_turns):
+            setter = getattr(client, "set_trace_context", None)
+            if callable(setter):
+                setter(request_id=request_id, phase="critic", round=round_number, turn=turn)
             response = client.create(
                 model=client.model,
                 instructions=SYSTEM_PROMPT,
                 input=history,
                 tools=tools,
                 tool_choice="auto",
-                max_output_tokens=1800,
+                # Leave the model's reasoning enabled, but bound the response
+                # through configuration so a local thinking model cannot
+                # consume the entire sample run without returning its critique.
+                max_output_tokens=self.config.max_output_tokens,
                 text={"format": {"type": "json_schema", "name": "evidence_critique", "strict": True, "schema": CRITIQUE_SCHEMA}},
-                store=False,
+                store=False, usage_kind="critic",
             )
             calls = response_function_calls(response)
             if not calls:
                 try:
-                    payload = json.loads(getattr(response, "output_text", ""))
+                    payload = parse_json_object(response_text(response))
+                    if not isinstance(payload, dict):
+                        raise ValueError("critic did not return a JSON object")
                     return payload, turn + 1, tool_count
                 except Exception:
                     history.extend(response_output_items(response))

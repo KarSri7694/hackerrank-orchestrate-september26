@@ -10,9 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from buywait.core import _effective_events, _optimized_changes, baseline, legal_changes, simulate, solve  # noqa: E402
 from buywait.domain import (EventStatus, EvidenceFact, FinancialEvent, FinancialProfile,
-                            FinancialRequest, PaymentMethod, RequestContext)  # noqa: E402
+                            FinancialRequest, Payment, PaymentMethod, RequestContext)  # noqa: E402
 from buywait.reconciliation import reconcile_events  # noqa: E402
-from buywait.recurrence import stream_key  # noqa: E402
+from buywait.recurrence import detect_recurrences, stream_key  # noqa: E402
 
 
 def event(event_id="e1", amount=Decimal("100"), direction="debit", status=EventStatus.SCHEDULED):
@@ -51,11 +51,55 @@ class ReconciliationTests(unittest.TestCase):
         ))
         self.assertEqual(resolved[0].status, EventStatus.CANCELLED)
 
+    def test_stream_update_inherits_existing_recurrence_when_model_omits_cadence(self):
+        history = tuple(FinancialEvent(
+            str(index), "u1", "income", "Payroll credit", "salary", "credit",
+            Decimal("100"), "USD", date(2024, month, 15), date(2024, month, 15),
+            EventStatus.SETTLED, None, "fixed", None
+        ) for index, month in enumerate((1, 2, 3), 1))
+        fact = EvidenceFact(
+            "salary-update", "stream_update", amount=Decimal("200"), currency="USD",
+            effective_date=date(2024, 4, 15), category="salary", direction="credit",
+            stream_source="New Employer"
+        )
+        resolved = reconcile_events(history, (fact,))
+        streams = detect_recurrences(resolved)
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(streams[0].representative.amount, Decimal("200"))
+        self.assertEqual(streams[0].cadence_days, 31)
+
+    def test_stream_update_inherits_recurrence_when_model_omits_recurrence_flag(self):
+        history = tuple(FinancialEvent(
+            str(index), "u1", "income", "Payroll credit", "salary", "credit",
+            Decimal("100"), "USD", date(2024, month, 15), date(2024, month, 15),
+            EventStatus.SETTLED, None, "fixed", None
+        ) for index, month in enumerate((1, 2, 3), 1))
+        fact = EvidenceFact(
+            "salary-update", "stream_update", amount=Decimal("200"), currency="USD",
+            effective_date=date(2024, 4, 15), category="salary", direction="credit",
+            stream_source="Payroll credit"
+        )
+        resolved = reconcile_events(history, (fact,))
+        streams = detect_recurrences(resolved)
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(streams[0].representative.amount, Decimal("200"))
+        self.assertEqual(streams[0].cadence_days, 31)
+
     def test_pending_credit_is_ignored_but_pending_debit_reserved(self):
         credit = event("credit", Decimal("100"), "credit", EventStatus.PENDING)
         debit = event("debit", Decimal("100"), "debit", EventStatus.PENDING)
         result = simulate(context((credit, debit)), type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})())
         self.assertEqual(result.ending_balance, Decimal("900"))
+
+    def test_simulator_rejects_payment_outside_forecast_instead_of_ignoring_it(self):
+        fx = type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})()
+        with self.assertRaises(ValueError):
+            simulate(context(()), fx, (Payment(date(2025, 4, 1), Decimal("1")),))
+
+    def test_simulator_rejects_non_positive_payment(self):
+        fx = type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})()
+        with self.assertRaises(ValueError):
+            simulate(context(()), fx, (Payment(date(2025, 1, 1), Decimal("0")),))
 
     def test_failed_event_has_no_cash_impact(self):
         failed = event(status=EventStatus.FAILED)
@@ -108,6 +152,15 @@ class ReconciliationTests(unittest.TestCase):
         fx = type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})()
         self.assertFalse(any(row[0] > req.request_date and row[3].category == "salary" for row in _effective_events(ctx, fx)))
 
+    def test_cancelled_single_occurrence_does_not_terminate_recurring_stream(self):
+        history = tuple(FinancialEvent(str(i), "u1", "expense", "Recurring rent", "rent", "debit", Decimal("100"), "USD", date(2024, m, 15), date(2024, m, 15), EventStatus.SETTLED, None, "fixed", None) for i, m in enumerate((1, 2, 3), 1))
+        cancelled = FinancialEvent("cancelled", "u1", "expense", "Recurring rent", "rent", "debit", Decimal("100"), "USD", date(2024, 4, 15), date(2024, 4, 15), EventStatus.CANCELLED, None, "fixed", None)
+        req = FinancialRequest("r1", "u1", date(2024, 4, 1), "purchase", Decimal("1"), date(2024, 6, 30), False, "test")
+        ctx = RequestContext(req, context(()).profile, history + (cancelled,), (), ())
+        fx = type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})()
+        generated = _effective_events(ctx, fx)
+        self.assertIn(date(2024, 5, 15), [row[0] for row in generated])
+
     def test_explicit_same_day_event_prevents_inferred_duplicate(self):
         history = tuple(FinancialEvent(str(i), "u1", "income", "Payroll", "salary", "credit", Decimal("100"), "USD", date(2024, m, 15), date(2024, m, 15), EventStatus.SETTLED, None, "fixed", None) for i, m in enumerate((1, 2, 3), 1))
         explicit = FinancialEvent("scheduled", "u1", "income", "Next salary", "salary", "credit", Decimal("100"), "USD", date(2024, 4, 15), date(2024, 4, 15), EventStatus.SCHEDULED, None, "fixed", None)
@@ -117,6 +170,26 @@ class ReconciliationTests(unittest.TestCase):
         rows = [row for row in _effective_events(ctx, fx) if row[0] == date(2024, 4, 15)]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][3].event_id, "scheduled")
+
+    def test_generic_future_event_does_not_suppress_same_label_other_currency(self):
+        history = []
+        for currency in ("USD", "EUR"):
+            history.extend(FinancialEvent(
+                f"{currency}-{month}", "u1", "income", "Payroll", "salary", "credit",
+                Decimal("100"), currency, date(2024, month, 15), date(2024, month, 15),
+                EventStatus.SETTLED, None, "fixed", None
+            ) for month in (1, 2, 3))
+        explicit = FinancialEvent(
+            "scheduled", "u1", "income", "Next salary", "salary", "credit",
+            Decimal("100"), "USD", date(2024, 4, 15), date(2024, 4, 15),
+            EventStatus.SCHEDULED, None, "fixed", None
+        )
+        request = FinancialRequest("r1", "u1", date(2024, 4, 1), "purchase", Decimal("1"), date(2024, 4, 30), False, "test")
+        ctx = RequestContext(request, context(()).profile, tuple(history) + (explicit,), (), ())
+        fx = type("FX", (), {"convert": lambda self, amount, source, target, on_date: amount})()
+        rows = _effective_events(ctx, fx)
+        on_day = [row for row in rows if row[0] == date(2024, 4, 15)]
+        self.assertEqual({row[3].currency for row in on_day}, {"USD", "EUR"})
 
     def test_optimizer_finds_minimum_reduction_and_resimulates(self):
         history = tuple(FinancialEvent(str(i), "u1", "expense", "dining", "dining", "debit", Decimal("100"), "USD", date(2024, m, 15), date(2024, m, 15), EventStatus.SETTLED, None, "reducible", Decimal("0")) for i, m in enumerate((10, 11, 12), 1))

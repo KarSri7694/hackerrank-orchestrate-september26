@@ -10,7 +10,7 @@ from .domain import (AffordabilityStatus, DecisionCore, EventStatus, FinancialEv
                      Payment, PaymentMethod, PlanCandidate, RequestContext,
                      SimulationResult, SpendingChange)
 from .reconciliation import reconcile_context
-from .recurrence import detect_recurrences, recurring_event_ids
+from .recurrence import detect_recurrences, event_stream_key, recurring_event_ids
 
 ZERO = Decimal("0")
 
@@ -26,13 +26,51 @@ def _effective_events(ctx: RequestContext, fx) -> list[tuple[date, Decimal, str,
     request_date = ctx.request.request_date
     end = request_date + timedelta(days=89)
     rows: list[tuple[date, Decimal, str, FinancialEvent]] = []
+    historical_keys_by_pair: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+    historical_events_by_pair: dict[tuple[str, str, str], list[FinancialEvent]] = defaultdict(list)
+    for historical in ctx.events:
+        if historical.status == EventStatus.SETTLED and historical.amount is not None:
+            pair = (historical.category, historical.direction, historical.currency)
+            historical_keys_by_pair[pair].add(event_stream_key(historical))
+            historical_events_by_pair[pair].append(historical)
+
+    def is_same_stream(candidate: FinancialEvent, representative: FinancialEvent) -> bool:
+        if candidate.currency and representative.currency and candidate.currency != representative.currency:
+            return False
+        if event_stream_key(candidate) == event_stream_key(representative):
+            return True
+        # A bank may label a confirmed future occurrence generically (for
+        # example, "next confirmed salary") while history carries the source
+        # name. Treat that label as the one historical stream only when the
+        # category/direction pair is unambiguous; never guess between two
+        # simultaneous employers or services.
+        candidate_source = event_stream_key(candidate).rsplit("|", 1)[-1]
+        if candidate_source:
+            return False
+        pair = (candidate.category, candidate.direction, candidate.currency)
+        keys = historical_keys_by_pair.get(pair, set())
+        if len(keys) == 1:
+            return event_stream_key(representative) in keys
+        # With several streams, an exact amount/currency match may still make
+        # a generic record unambiguous. Do not use approximate amounts: a
+        # false match would silently drop income or double-count it.
+        matching_keys = {
+            event_stream_key(item) for item in historical_events_by_pair.get(pair, ())
+            if item.amount == candidate.amount and item.currency == candidate.currency
+        }
+        return len(matching_keys) == 1 and event_stream_key(representative) in matching_keys
     for event in ctx.events:
         if event.event_type in {"internal_transfer", "aggregate_superseded"} or event.status in {EventStatus.FAILED, EventStatus.CANCELLED, EventStatus.UNREALIZED} or event.amount is None:
             continue
         if event.status == EventStatus.PENDING and event.direction == "credit":
             continue
         event_day = event.settlement_date or event.event_date
-        if event.status == EventStatus.PENDING and event.direction == "debit" and event.settlement_date is None and event_day < request_date:
+        if (event.status == EventStatus.PENDING and event.direction == "debit"
+                and event_day < request_date):
+            # A pending debit is already reserved even when its source row is
+            # stale. Only a settlement date in the future gives us a more
+            # precise date; otherwise reserve it immediately at the request
+            # boundary.
             event_day = request_date
         if event_day >= request_date and event_day <= end:
             rows.append((event_day, _cash(event, ctx.profile.home_currency, fx, event_day), event.event_id, event))
@@ -45,7 +83,13 @@ def _effective_events(ctx: RequestContext, fx) -> list[tuple[date, Decimal, str,
             # An explicit event on the same date wins over an inferred one;
             # descriptions can differ when a bank/payroll system changes its
             # wording, so category/direction/date are the stable identity.
-            same_stream_exists = any(x[0] == next_day and x[3].category == last.category and x[3].direction == last.direction for x in rows)
+            # Two simultaneous streams may share a category and direction
+            # (for example two employers). Only an explicit event from this
+            # stream suppresses its inferred occurrence.
+            same_stream_exists = any(x[0] == next_day
+                                     and (is_same_stream(x[3], last)
+                                          or last.event_type == "aggregate_stream_update")
+                                     for x in rows)
             if not same_stream_exists:
                 rows.append((next_day, _cash(last, ctx.profile.home_currency, fx, next_day), last.event_id, last))
             next_day = stream.next_date(next_day)
@@ -86,8 +130,23 @@ def validate_changes(ctx: RequestContext, changes: tuple[SpendingChange, ...]) -
             raise ValueError(f"unsupported spending change action: {change.action}")
 
 
+def _validate_payments(ctx: RequestContext, payments: tuple[Payment, ...]) -> None:
+    """Reject schedules that the bounded forecast would otherwise ignore."""
+    end = ctx.request.request_date + timedelta(days=89)
+    previous = None
+    for payment in payments:
+        if payment.amount <= ZERO:
+            raise ValueError("payment amounts must be positive")
+        if not ctx.request.request_date <= payment.date <= end:
+            raise ValueError("payment date must be within the 90-day forecast")
+        if previous is not None and payment.date < previous:
+            raise ValueError("payment plan must be chronological")
+        previous = payment.date
+
+
 def simulate(ctx: RequestContext, fx, payments: tuple[Payment, ...] = (), changes: tuple[SpendingChange, ...] = ()) -> SimulationResult:
     ctx = reconcile_context(ctx)
+    _validate_payments(ctx, payments)
     validate_changes(ctx, changes)
     changes_by_id = {c.event_id: c for c in changes}
     timeline = _effective_events(ctx, fx)
@@ -260,7 +319,10 @@ def solve(ctx: RequestContext, fx) -> DecisionCore:
             if option.payment_method != PaymentMethod.INSTALLMENTS:
                 continue
             payments = expand_option(option)
-            if not payments or payments[0].date < req.request_date or payments[-1].date > req.desired_completion_date:
+            forecast_end = req.request_date + timedelta(days=89)
+            if (not payments or payments[0].date < req.request_date
+                    or payments[-1].date > req.desired_completion_date
+                    or payments[-1].date > forecast_end):
                 continue
             months = _calendar_months_between(payments[0].date, payments[-1].date)
             if ctx.profile.max_installment_months is None or months <= ctx.profile.max_installment_months:

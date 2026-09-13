@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 from pathlib import Path
 
@@ -37,5 +38,37 @@ class MCPToolBridge:
         return asyncio.run(self._call(name, arguments))
 
     def openai_tools(self):
-        return [{"type": "function", "name": tool.name, "description": tool.description or "", "parameters": tool.inputSchema, "strict": True} for tool in self.list_tools()]
+        return [{"type": "function", "name": tool.name, "description": tool.description or "",
+                 "parameters": _strict_object_schema(tool.inputSchema), "strict": True}
+                for tool in self.list_tools()]
 
+
+def _strict_object_schema(schema):
+    """Make FastMCP/Pydantic schemas valid for strict OpenAI function calls.
+
+    FastMCP commonly omits ``additionalProperties`` for ordinary object
+    schemas. OpenAI strict tools require it to be false at every object node,
+    including objects nested under arrays or ``anyOf``. Work on a copy so the
+    MCP server's own schema is never mutated.
+    """
+    result = deepcopy(schema)
+    def visit(node):
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "object":
+            node.setdefault("additionalProperties", False)
+            # Strict function schemas require every declared property to be
+            # present. Optional application inputs are already represented by
+            # nullable schemas, so requiring the key is lossless and avoids
+            # provider-side schema rejection.
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                node["required"] = list(properties)
+        for value in node.values():
+            if isinstance(value, dict):
+                visit(value)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+    visit(result)
+    return result

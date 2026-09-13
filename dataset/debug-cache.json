@@ -1,0 +1,25 @@
+{
+  "message_01:debug:evidence-facts-v22:842f9155a4c587f70e36fc7088a8ddb7cc219aa0ad09df92f6d3f18a18f5db07": [
+    {
+      "evidence_id": "message_01",
+      "effect": "stream_update",
+      "related_event_id": null,
+      "amount": "42750000",
+      "currency": "IDR",
+      "effective_date": "2025-08-15",
+      "status": null,
+      "confidence": 1.0,
+      "source_type": "employer",
+      "sent_at": "2025-07-29T09:30:00+00:00",
+      "category": "salary",
+      "direction": "credit",
+      "description": null,
+      "recurring": null,
+      "recurrence_days": null,
+      "stream_key": null,
+      "stream_source": "Payroll credit",
+      "flexibility": "fixed",
+      "minimum_allowed_amount": null
+    }
+  ]
+}
